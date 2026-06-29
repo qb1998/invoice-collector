@@ -466,9 +466,15 @@ def collect_invoices(task_id, config):
         for j, sd in enumerate(supporting_docs):
             if j not in used_supporting:
                 ordered_items.append(('supporting', sd))
-        # Number all items sequentially
+        # === Number items: skip duplicates ===
+        # 重复发票不分配序号(设为空)，其它项按出现顺序编号
+        non_dup_seq = 0
         for i, (item_type, item) in enumerate(ordered_items):
-            item['seq_num'] = '%03d' % (i + 1)
+            if item_type == 'invoice' and item.get('is_duplicate'):
+                item['seq_num'] = ''  # 重复发票不编号
+            else:
+                non_dup_seq += 1
+                item['seq_num'] = '%03d' % non_dup_seq
         # Update duplicate references with seq numbers
         for inv in invoices:
             if inv.get('is_duplicate') and inv.get('duplicate_of'):
@@ -522,23 +528,31 @@ def collect_invoices(task_id, config):
                 cat = inv.get('category', '')
                 dt = inv.get('date', '')
                 amt = inv.get('amount', '')
-                nfn = '%s-%s-%s-%s%s' % (inv['seq_num'], cat, dt, amt, ext) if dt and amt else '%s-%s%s' % (inv['seq_num'], cat, ext)
+                is_dup = inv.get('is_duplicate', False)
+                seq = inv.get('seq_num', '')
+                if is_dup:
+                    # 重复发票不重命名、不产生新文件名
+                    nfn = ''
+                else:
+                    nfn = '%s-%s-%s-%s%s' % (seq, cat, dt, amt, ext) if dt and amt else '%s-%s%s' % (seq, cat, ext)
                 amt_val = amt
                 try:
                     amt_val = float(amt)
                 except:
                     pass
                 remark = ''
-                if inv.get('is_duplicate'):
-                    remark = '⚠️重复发票，与序号%s重复' % inv.get('duplicate_of_seq', '')
+                if is_dup:
+                    remark = '⚠️与序号%s重复，本条不计入' % inv.get('duplicate_of_seq', '')
+                # 对应发票序号：非重复发票填自身序号；重复发票填原发票序号
+                corr_seq = inv.get('duplicate_of_seq', '') if is_dup else seq
                 row_data = [
-                    inv['seq_num'], '发票', inv['region'], cat, dt,
+                    seq, '发票', inv['region'], cat, dt,
                     inv['invoice_no'], inv.get('amount_no_tax', ''),
                     inv.get('tax', ''), amt_val, inv['buyer'], inv['seller'],
-                    inv['seq_num'], inv['source_file'], nfn, '', remark
+                    corr_seq, inv['source_file'], nfn, '', remark
                 ]
                 all_rows.append({'nfn': nfn, 'data': row_data, 'type': 'invoice',
-                                 'source': inv, 'is_duplicate': inv.get('is_duplicate', False)})
+                                 'source': inv, 'is_duplicate': is_dup})
             else:
                 sd = item
                 ext = Path(sd['source_file']).suffix.lower()
@@ -618,12 +632,18 @@ def collect_invoices(task_id, config):
         ws2.column_dimensions['D'].width = 10
         xlsx_path = work_dir / '发票信息统计.xlsx'
         wb.save(str(xlsx_path))
-        # Copy files to processed dir with new names
+        # Copy files to processed dir with new names (skip duplicate invoices)
         processed_dir = work_dir / 'processed'
+        # Clean processed dir first to avoid stale files
+        if processed_dir.exists():
+            shutil.rmtree(processed_dir)
         processed_dir.mkdir(parents=True, exist_ok=True)
         for r in all_rows:
+            new_name = r.get('nfn', '')
+            if not new_name:
+                # 重复发票没有新文件名，不复制
+                continue
             src_name = r['data'][12]
-            new_name = r['nfn']
             src_path = raw_dir / src_name if src_name else None
             if src_path and src_path.exists():
                 dst = processed_dir / new_name
@@ -779,7 +799,8 @@ async def download_excel(task_id: str):
 
 @app.get("/api/download-all/{task_id}")
 async def download_all_files(task_id: str):
-    """Download all files as a ZIP archive, including the Excel summary."""
+    """Download all files as a ZIP archive, including the Excel summary.
+    Note: Duplicate invoices are EXCLUDED from the ZIP (matches Excel table content)."""
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="任务不存在")
     task = tasks[task_id]
@@ -790,17 +811,24 @@ async def download_all_files(task_id: str):
     if not processed_dir.exists():
         raise HTTPException(status_code=404, detail="文件目录不存在")
     zip_buffer = io.BytesIO()
+    file_count = 0
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         xlsx_path = work_dir / '发票信息统计.xlsx'
         if xlsx_path.exists():
             zf.write(str(xlsx_path), '发票信息统计.xlsx')
+            file_count += 1
         for f in sorted(processed_dir.glob('*')):
-            zf.write(str(f), f.name)
+            if f.is_file():
+                zf.write(str(f), f.name)
+                file_count += 1
     zip_buffer.seek(0)
+    from urllib.parse import quote
+    zip_filename = '发票文件包_%s.zip' % task_id
+    encoded_name = quote(zip_filename)
     return StreamingResponse(
         zip_buffer,
         media_type='application/zip',
-        headers={'Content-Disposition': 'attachment; filename*=UTF-8\'\'%s' % ('发票文件包_%s.zip' % task_id)}
+        headers={'Content-Disposition': "attachment; filename=\"%s\"; filename*=UTF-8''%s" % ('invoice_%s.zip' % task_id, encoded_name)}
     )
 
 @app.get("/api/files/{task_id}")
@@ -873,6 +901,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hira
 .btn-success:hover{opacity:.9;transform:translateY(-1px)}
 .btn-outline{background:#fff;color:var(--primary);border:1.5px solid var(--primary)}
 .btn-outline:hover{background:var(--primary-light)}
+.btn-mini{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;font-size:13px;font-weight:600;color:#fff;background:var(--primary);border-radius:6px;text-decoration:none;transition:all .2s}
+.btn-mini:hover{background:var(--primary-hover);transform:translateY(-1px)}
 .progress-bar-container{background:var(--gray-100);border-radius:99px;height:10px;overflow:hidden;margin-bottom:12px}
 .progress-bar{height:100%;background:linear-gradient(90deg,var(--primary),#818CF8);border-radius:99px;transition:width .5s ease;width:0}
 .progress-text{font-size:14px;color:var(--gray-600);text-align:center}
@@ -1179,7 +1209,7 @@ let amountCell='-';
 if(item.amount){
 amountCell='<span style="color:#DC2626;font-weight:600;">¥'+item.amount+'</span>';
 }
-tr.innerHTML='<td>'+item.seq+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td>';
+tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td>';
 tbody.appendChild(tr);
 });
 }else{
@@ -1188,7 +1218,7 @@ result.invoices.forEach(function(inv){
 const tr=document.createElement('tr');
 tr.className=inv.is_duplicate?'duplicate-row':'invoice-row';
 let badge=inv.is_duplicate?'<span class="badge badge-duplicate">重复</span>':'<span class="badge badge-invoice">发票</span>';
-tr.innerHTML='<td>'+inv.seq+'</td><td>'+badge+'</td><td>'+inv.region+'</td><td>'+inv.category+'</td><td>'+inv.date+'</td><td style="font-family:monospace;font-size:12px;">'+inv.invoice_no+'</td><td style="color:#DC2626;font-weight:600;">¥'+inv.amount+'</td><td>'+inv.buyer+'</td><td>'+inv.seller+'</td><td style="font-size:12px;color:#DC2626;">'+(inv.remark||'')+'</td>';
+tr.innerHTML='<td style="'+(inv.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(inv.seq||'—')+'</td><td>'+badge+'</td><td>'+inv.region+'</td><td>'+inv.category+'</td><td>'+inv.date+'</td><td style="font-family:monospace;font-size:12px;">'+inv.invoice_no+'</td><td style="color:#DC2626;font-weight:600;">¥'+inv.amount+'</td><td>'+inv.buyer+'</td><td>'+inv.seller+'</td><td style="font-size:12px;color:#DC2626;">'+(inv.remark||'')+'</td>';
 tbody.appendChild(tr);
 });
 result.supporting_docs.forEach(function(sd){
@@ -1224,10 +1254,11 @@ const resp=await fetch(API_BASE+'/api/files/'+currentTaskId);
 const data=await resp.json();
 const container=document.getElementById('filesList');
 if(!data.files||data.files.length===0){container.innerHTML='<p style="color:var(--gray-400);">暂无文件</p>';return;}
-let html='<div style="display:grid;grid-template-columns:1fr auto;gap:4px 12px;font-size:13px;">';
+let html='<div style="display:grid;grid-template-columns:1fr auto auto;gap:6px 12px;font-size:13px;align-items:center;">';
 data.files.forEach(function(f){
 var size=f.size>1024*1024?(f.size/1024/1024).toFixed(1)+' MB':(f.size/1024).toFixed(0)+' KB';
-html+='<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+f.name+'">'+f.name+'</div><div style="color:var(--gray-400);white-space:nowrap;">'+size+'</div>';
+var encoded=encodeURIComponent(f.name);
+html+='<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+f.name+'">'+f.name+'</div><div style="color:var(--gray-400);white-space:nowrap;">'+size+'</div><div><a class="btn-mini" href="'+API_BASE+'/api/file/'+currentTaskId+'/'+encoded+'" target="_blank" download title="下载该文件">⬇</a></div>';
 });
 html+='</div>';
 container.innerHTML=html;
