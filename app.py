@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-发票收集器 - 单文件版 v2.0
+发票收集器 - 单文件版 v2.2
 新增功能：
 1. 文件打包下载（ZIP）
 2. 发票号去重并标注
 3. 分类金额汇总
 4. 相关文件相邻排列
+5. 按购买方名称筛选发票（公司筛选）
+6. 逐行删除单据并自动重排（发票编辑）
+7. 解析邮件 INTERNALDATE，新增"邮件日期"列
 运行方式: python app.py
 然后浏览器打开 http://localhost:8000
 """
@@ -19,13 +22,13 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 import pdfplumber
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
-app = FastAPI(title="发票收集器", version="2.0.0")
+app = FastAPI(title="发票收集器", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,12 +45,18 @@ class MailConfig(BaseModel):
     port: int = 993
     date_from: str
     date_to: str
+    companies: list[str] = []  # 购买方筛选，[] 表示不过滤
 
 class TaskStatus(BaseModel):
+    model_config = ConfigDict(extra='allow')  # 允许挂载 state
     task_id: str
     status: str
     progress: str
     result: Optional[dict] = None
+
+class RemoveItemRequest(BaseModel):
+    source_file: str  # 唯一标识发票/辅助单据
+    item_type: str   # 'invoice' | 'supporting'
 
 tasks = {}
 
@@ -447,344 +456,401 @@ def collect_invoices(task_id, config):
         # Sort invoices by date+amount
         invoices.sort(key=lambda x: (x.get('date', '9999-99-99'),
                                      float(x.get('amount', '0') or 0)))
-        # === Interleave: place supporting docs next to matching invoices ===
-        ordered_items = []
-        used_supporting = set()
-        for inv in invoices:
-            ordered_items.append(('invoice', inv))
-            inv_uid = inv.get('file_uid', '')
-            inv_seller = inv.get('seller', '')
-            inv_cat = inv.get('category', '')
-            for j, sd in enumerate(supporting_docs):
-                if j in used_supporting:
-                    continue
-                sd_uid = sd.get('file_uid', '')
-                sd_type = sd.get('type', '')
-                matched = False
-                # Rule 1: same email UID
-                if sd_uid and inv_uid and sd_uid == inv_uid:
-                    matched = True
-                # Rule 2: hotel confirmation matches hotel invoice by seller name
-                elif sd_type == '酒店确认单' and inv_cat == '住宿':
-                    sd_text = sd.get('text_snippet', '')
-                    if inv_seller:
-                        seller_keywords = [inv_seller[i:i+3] for i in range(0, min(len(inv_seller), 8), 2)]
-                        if any(kw in sd_text for kw in seller_keywords if len(kw) >= 2):
-                            matched = True
-                        else:
-                            hotel_invs = [i for i in invoices if i.get('category') == '住宿']
-                            hotel_sds = [(k, s) for k, s in enumerate(supporting_docs)
-                                         if s.get('type') == '酒店确认单' and k not in used_supporting]
-                            if len(hotel_invs) == 1 and len(hotel_sds) == 1:
-                                matched = True
-                # Rule 3: itinerary matches transportation invoice
-                elif sd_type == '机票行程单' and inv_cat == '交通':
-                    matched = True
-                # Rule 4: travel materials match any invoice from same date range
-                elif sd_type == '出差行程材料':
-                    if inv_uid and sd_uid and inv_uid == sd_uid:
-                        matched = True
-                if matched:
-                    ordered_items.append(('supporting', sd))
-                    used_supporting.add(j)
-        # Add remaining unmatched supporting docs at the end
-        for j, sd in enumerate(supporting_docs):
-            if j not in used_supporting:
-                ordered_items.append(('supporting', sd))
-        # === Number items: skip duplicates ===
-        # 重复发票不分配序号(设为空)，其它项按出现顺序编号
-        non_dup_seq = 0
-        for i, (item_type, item) in enumerate(ordered_items):
-            if item_type == 'invoice' and item.get('is_duplicate'):
-                item['seq_num'] = ''  # 重复发票不编号
-            else:
-                non_dup_seq += 1
-                item['seq_num'] = '%03d' % non_dup_seq
-        # Update duplicate references with seq numbers
-        for inv in invoices:
-            if inv.get('is_duplicate') and inv.get('duplicate_of'):
-                inv['duplicate_of_seq'] = inv['duplicate_of'].get('seq_num', '')
-            else:
-                inv['duplicate_of_seq'] = ''
-        # === Compute category summary (excluding duplicates) ===
-        category_summary = {}
-        for inv in invoices:
-            if inv.get('is_duplicate'):
-                continue
-            cat = inv.get('category', '其他')
-            try:
-                amt = float(inv.get('amount', 0) or 0)
-            except:
-                amt = 0
-            category_summary[cat] = round(category_summary.get(cat, 0) + amt, 2)
-        duplicate_count = sum(1 for inv in invoices if inv.get('is_duplicate'))
-        # === Generate Excel ===
-        tasks[task_id].progress = '正在生成Excel表格...'
-        wb = Workbook()
-        ws = wb.active
-        ws.title = '发票信息'
-        headers = ['序号','文件类型','地区','类目','邮件日期','发票日期','发票号码',
-                   '不含税金额','税额','金额','购买方名称','销售方名称',
-                   '对应发票序号','原文件名','新文件名','关联方式','备注']
-        header_font = Font(name='微软雅黑', bold=True, size=11, color='FFFFFF')
-        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
-        header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        thin_border = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
-        )
-        for col, h in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col, value=h)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = header_alignment
-            cell.border = thin_border
-        data_font = Font(name='微软雅黑', size=10)
-        data_alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
-        center_alignment = Alignment(horizontal='center', vertical='center')
-        dup_fill = PatternFill(start_color='FEE2E2', end_color='FEE2E2', fill_type='solid')
-        supp_fill = PatternFill(start_color='FEF3C7', end_color='FEF3C7', fill_type='solid')
-        inv_fill = PatternFill(start_color='F0FDF4', end_color='F0FDF4', fill_type='solid')
-        all_rows = []
-        for item_type, item in ordered_items:
-            if item_type == 'invoice':
-                inv = item
-                ext = Path(inv['source_file']).suffix.lower()
-                cat = inv.get('category', '')
-                dt = inv.get('date', '')
-                amt = inv.get('amount', '')
-                is_dup = inv.get('is_duplicate', False)
-                seq = inv.get('seq_num', '')
-                if is_dup:
-                    # 重复发票不重命名、不产生新文件名
-                    nfn = ''
-                else:
-                    nfn = '%s-%s-%s-%s%s' % (seq, cat, dt, amt, ext) if dt and amt else '%s-%s%s' % (seq, cat, ext)
-                amt_val = amt
-                try:
-                    amt_val = float(amt)
-                except:
-                    pass
-                remark = ''
-                if is_dup:
-                    remark = '⚠️与序号%s重复，本条不计入' % inv.get('duplicate_of_seq', '')
-                # 对应发票序号：非重复发票填自身序号；重复发票填原发票序号
-                corr_seq = inv.get('duplicate_of_seq', '') if is_dup else seq
-                row_data = [
-                    seq, '发票', inv['region'], cat, inv.get('email_date', ''), dt,
-                    inv['invoice_no'], inv.get('amount_no_tax', ''),
-                    inv.get('tax', ''), amt_val, inv['buyer'], inv['seller'],
-                    corr_seq, inv['source_file'], nfn, '', remark
-                ]
-                all_rows.append({'nfn': nfn, 'data': row_data, 'type': 'invoice',
-                                 'source': inv, 'is_duplicate': is_dup})
-            else:
-                sd = item
-                ext = Path(sd['source_file']).suffix.lower()
-                cat = sd.get('type', '')
-                nfn = '%s-%s%s' % (sd['seq_num'], cat, ext)
-                related_seq = ''
-                sd_uid = sd.get('file_uid', '')
-                for item_type2, item2 in ordered_items:
-                    if item_type2 == 'invoice':
-                        i_uid = item2.get('file_uid', '')
-                        if sd_uid and i_uid and sd_uid == i_uid:
-                            related_seq = item2['seq_num']
-                            break
-                remark = ''
-                relation = ''
-                if related_seq:
-                    remark = '关联发票序号%s' % related_seq
-                    relation = '关联'
-                row_data = [
-                    sd['seq_num'], sd.get('row_type', '辅助单据'), '', '', sd.get('email_date', ''), '',
-                    '', '', '', '', '', '',
-                    related_seq, sd['source_file'], nfn, relation, remark
-                ]
-                all_rows.append({'nfn': nfn, 'data': row_data, 'type': 'supporting', 'source': sd})
-        for i, r in enumerate(all_rows):
-            row = i + 2
-            for col, val in enumerate(r['data'], 1):
-                cell = ws.cell(row=row, column=col, value=val)
-                cell.font = data_font
-                cell.alignment = center_alignment if col in [1,3,4,5,12,15] else data_alignment
-                cell.border = thin_border
-                if r.get('is_duplicate'):
-                    cell.fill = dup_fill
-                elif r['type'] == 'invoice':
-                    cell.fill = inv_fill
-                elif r['type'] == 'supporting':
-                    cell.fill = supp_fill
-        col_widths = [6, 10, 8, 8, 12, 12, 24, 12, 10, 12, 22, 30, 10, 30, 30, 8, 24]
-        for i, w in enumerate(col_widths):
-            ws.column_dimensions[chr(65 + i)].width = w
-        # === Add category summary sheet ===
-        ws2 = wb.create_sheet('分类汇总')
-        ws2.cell(row=1, column=1, value='类别').font = header_font
-        ws2.cell(row=1, column=2, value='金额(¥)').font = header_font
-        ws2.cell(row=1, column=3, value='占比').font = header_font
-        ws2.cell(row=1, column=4, value='发票数').font = header_font
-        for c in range(1, 5):
-            ws2.cell(row=1, column=c).fill = header_fill
-            ws2.cell(row=1, column=c).alignment = header_alignment
-            ws2.cell(row=1, column=c).border = thin_border
-        total_cat = sum(category_summary.values())
-        inv_count_by_cat = {}
-        for inv in invoices:
-            if inv.get('is_duplicate'):
-                continue
-            cat = inv.get('category', '其他')
-            inv_count_by_cat[cat] = inv_count_by_cat.get(cat, 0) + 1
-        for i, (cat, amt) in enumerate(sorted(category_summary.items(), key=lambda x: -x[1])):
-            r = i + 2
-            ws2.cell(row=r, column=1, value=cat).border = thin_border
-            ws2.cell(row=r, column=2, value=amt).border = thin_border
-            ws2.cell(row=r, column=2).number_format = '#,##0.00'
-            pct = '%.1f%%' % (amt / total_cat * 100) if total_cat > 0 else '0%'
-            ws2.cell(row=r, column=3, value=pct).border = thin_border
-            ws2.cell(row=r, column=4, value=inv_count_by_cat.get(cat, 0)).border = thin_border
-        total_row = len(category_summary) + 2
-        ws2.cell(row=total_row, column=1, value='合计').font = Font(name='微软雅黑', bold=True, size=11)
-        ws2.cell(row=total_row, column=2, value=total_cat).font = Font(name='微软雅黑', bold=True, size=11)
-        ws2.cell(row=total_row, column=2).number_format = '#,##0.00'
-        ws2.cell(row=total_row, column=3, value='100%').font = Font(name='微软雅黑', bold=True, size=11)
-        ws2.cell(row=total_row, column=4, value=sum(inv_count_by_cat.values())).font = Font(name='微软雅黑', bold=True, size=11)
-        for c in range(1, 5):
-            ws2.cell(row=total_row, column=c).border = thin_border
-        ws2.column_dimensions['A'].width = 16
-        ws2.column_dimensions['B'].width = 16
-        ws2.column_dimensions['C'].width = 10
-        ws2.column_dimensions['D'].width = 10
-        xlsx_path = work_dir / '发票信息统计.xlsx'
-        wb.save(str(xlsx_path))
-        # Copy files to processed dir with new names (skip duplicate invoices)
-        processed_dir = work_dir / 'processed'
-        # Clean processed dir first to avoid stale files
-        if processed_dir.exists():
-            shutil.rmtree(processed_dir)
-        processed_dir.mkdir(parents=True, exist_ok=True)
-        for r in all_rows:
-            new_name = r.get('nfn', '')
-            if not new_name:
-                # 重复发票没有新文件名，不复制
-                continue
-            src_name = r['data'][12]
-            src_path = raw_dir / src_name if src_name else None
-            if src_path and src_path.exists():
-                dst = processed_dir / new_name
-                c = 1
-                while dst.exists():
-                    base, ext = new_name.rsplit('.', 1) if '.' in new_name else (new_name, '')
-                    dst = processed_dir / ('%s_%d.%s' % (base, c, ext)) if ext else processed_dir / ('%s_%d' % (base, c))
-                    c += 1
-                shutil.copy2(str(src_path), str(dst))
-        # Build result
-        total_amount = sum(float(inv.get('amount', 0) or 0) for inv in invoices if not inv.get('is_duplicate'))
-        # Build all_items for frontend display (interleaved)
-        all_items = []
-        for item_type, item in ordered_items:
-            if item_type == 'invoice':
-                inv = item
-                remark = ''
-                if inv.get('is_duplicate'):
-                    remark = '⚠️重复发票，与序号%s重复' % inv.get('duplicate_of_seq', '')
-                all_items.append({
-                    'seq': inv['seq_num'],
-                    'item_type': 'invoice',
-                    'is_duplicate': inv.get('is_duplicate', False),
-                    'duplicate_of_seq': inv.get('duplicate_of_seq', ''),
-                    'region': inv['region'],
-                    'category': inv['category'],
-                    'date': inv['date'],
-                    'email_date': inv.get('email_date', ''),
-                    'invoice_no': inv['invoice_no'],
-                    'amount': inv['amount'],
-                    'amount_no_tax': inv.get('amount_no_tax', ''),
-                    'tax': inv.get('tax', ''),
-                    'buyer': inv['buyer'],
-                    'seller': inv['seller'],
-                    'remark': remark,
-                    'source_file': inv['source_file'],
-                })
-            else:
-                sd = item
-                related_seq = ''
-                sd_uid = sd.get('file_uid', '')
-                for item_type2, item2 in ordered_items:
-                    if item_type2 == 'invoice':
-                        i_uid = item2.get('file_uid', '')
-                        if sd_uid and i_uid and sd_uid == i_uid:
-                            related_seq = item2['seq_num']
-                            break
-                remark = ''
-                if related_seq:
-                    remark = '关联发票 #%s' % related_seq
-                all_items.append({
-                    'seq': sd['seq_num'],
-                    'item_type': 'supporting',
-                    'is_duplicate': False,
-                    'duplicate_of_seq': '',
-                    'region': '',
-                    'category': sd.get('type', ''),
-                    'date': '',
-                    'email_date': sd.get('email_date', ''),
-                    'invoice_no': '',
-                    'amount': '',
-                    'amount_no_tax': '',
-                    'tax': '',
-                    'buyer': '',
-                    'seller': '',
-                    'remark': remark,
-                    'source_file': sd['source_file'],
-                })
-        result = {
-            'task_id': task_id,
-            'search_info': {
-                'date_from': config.date_from,
-                'date_to': config.date_to,
-                'imap_search': search_criteria,
-                'emails_found': total_emails,
-                'note': '日期范围筛选的是邮件接收时间（INTERNALDATE），不是发票上的开票日期。如有 2/3 月份的发票出现在结果中，说明这些邮件是 6 月份收到的。',
-            },
-            'total_emails': total_emails,
-            'total_attachments': len(all_attachments),
-            'invoice_count': len(invoices),
-            'duplicate_count': duplicate_count,
-            'supporting_count': len(supporting_docs),
-            'total_amount': round(total_amount, 2),
-            'category_summary': category_summary,
-            'all_items': all_items,
-            'invoices': [
-                {
-                    'seq': inv['seq_num'], 'invoice_no': inv['invoice_no'],
-                    'date': inv['date'], 'amount': inv['amount'],
-                    'amount_no_tax': inv.get('amount_no_tax', ''),
-                    'tax': inv.get('tax', ''),
-                    'buyer': inv['buyer'], 'seller': inv['seller'],
-                    'region': inv['region'], 'category': inv['category'],
-                    'is_duplicate': inv.get('is_duplicate', False),
-                    'duplicate_of_seq': inv.get('duplicate_of_seq', ''),
-                    'remark': '⚠️重复发票，与序号%s重复' % inv.get('duplicate_of_seq', '') if inv.get('is_duplicate') else '',
-                } for inv in invoices
-            ],
-            'supporting_docs': [
-                {
-                    'seq': sd['seq_num'], 'type': sd.get('type', ''),
-                    'source_file': sd['source_file'],
-                } for sd in supporting_docs
-            ],
-            'no_attach_invoice_emails': [
-                {
-                    'uid': e['uid'], 'subject': e['subject'],
-                    'from': e['from'], 'invoice_urls': e.get('invoice_urls', []),
-                } for e in no_attach_invoice_emails[:20]
-            ],
+        # === Company filter (按购买方名称筛选) ===
+        company_filter = set()
+        if config.companies:
+            for line in config.companies:
+                for c in re.split(r'[,\n，、;；\s]+', line):
+                    c = c.strip()
+                    if c:
+                        company_filter.add(c)
+        all_companies = sorted({inv['buyer'] for inv in invoices if inv.get('buyer')})
+        if company_filter:
+            before = len(invoices)
+            invoices = [inv for inv in invoices if any(c in inv.get('buyer', '') for c in company_filter)]
+            tasks[task_id].progress = '按购买方筛选 %d -> %d 张发票' % (before, len(invoices))
+        # === Save state for later edit operations (delete item, etc.) ===
+        tasks[task_id].state = {
             'work_dir': str(work_dir),
+            'raw_dir': str(raw_dir),
+            'invoices': invoices,
+            'supporting_docs': supporting_docs,
+            'all_attachments': all_attachments,
+            'all_companies': all_companies,
+            'company_filter': list(company_filter),
+            'email': config.email,
+            'date_from': config.date_from,
+            'date_to': config.date_to,
+            'search_criteria': search_criteria,
+            'total_emails': total_emails,
+            'no_attach_invoice_emails': no_attach_invoice_emails,
         }
-        tasks[task_id].status = 'completed'
-        tasks[task_id].progress = '完成！共 %d 张发票（含 %d 张重复），%d 个辅助文件，合计 ¥%.2f' % (
-            len(invoices), duplicate_count, len(supporting_docs), total_amount)
-        tasks[task_id].result = result
+        # === Generate Excel/ZIP/result via reusable function ===
+        rebuild_outputs(task_id)
+        return
+    except Exception as e:
+        tasks[task_id].status = 'failed'
+        tasks[task_id].progress = '错误: %s' % str(e)
+        import traceback
+        traceback.print_exc()
+
+def rebuild_outputs(task_id):
+    """从 tasks[task_id].state 读取已解析的发票/辅助单据，重新生成 Excel/ZIP/result。
+    可在 collect_invoices 完成后调用，也可在删除单据后调用。"""
+    state = tasks[task_id].state
+    invoices = state['invoices']
+    supporting_docs = state['supporting_docs']
+    work_dir = Path(state['work_dir'])
+    raw_dir = Path(state['raw_dir'])
+    date_from = state['date_from']
+    date_to = state['date_to']
+    search_criteria = state['search_criteria']
+    total_emails = state['total_emails']
+    no_attach_invoice_emails = state['no_attach_invoice_emails']
+    all_attachments = state['all_attachments']
+    try:
+
+            # === Interleave: place supporting docs next to matching invoices ===
+            ordered_items = []
+            used_supporting = set()
+            for inv in invoices:
+                ordered_items.append(('invoice', inv))
+                inv_uid = inv.get('file_uid', '')
+                inv_seller = inv.get('seller', '')
+                inv_cat = inv.get('category', '')
+                for j, sd in enumerate(supporting_docs):
+                    if j in used_supporting:
+                        continue
+                    sd_uid = sd.get('file_uid', '')
+                    sd_type = sd.get('type', '')
+                    matched = False
+                    # Rule 1: same email UID
+                    if sd_uid and inv_uid and sd_uid == inv_uid:
+                        matched = True
+                    # Rule 2: hotel confirmation matches hotel invoice by seller name
+                    elif sd_type == '酒店确认单' and inv_cat == '住宿':
+                        sd_text = sd.get('text_snippet', '')
+                        if inv_seller:
+                            seller_keywords = [inv_seller[i:i+3] for i in range(0, min(len(inv_seller), 8), 2)]
+                            if any(kw in sd_text for kw in seller_keywords if len(kw) >= 2):
+                                matched = True
+                            else:
+                                hotel_invs = [i for i in invoices if i.get('category') == '住宿']
+                                hotel_sds = [(k, s) for k, s in enumerate(supporting_docs)
+                                             if s.get('type') == '酒店确认单' and k not in used_supporting]
+                                if len(hotel_invs) == 1 and len(hotel_sds) == 1:
+                                    matched = True
+                    # Rule 3: itinerary matches transportation invoice
+                    elif sd_type == '机票行程单' and inv_cat == '交通':
+                        matched = True
+                    # Rule 4: travel materials match any invoice from same date range
+                    elif sd_type == '出差行程材料':
+                        if inv_uid and sd_uid and inv_uid == sd_uid:
+                            matched = True
+                    if matched:
+                        ordered_items.append(('supporting', sd))
+                        used_supporting.add(j)
+            # Add remaining unmatched supporting docs at the end
+            for j, sd in enumerate(supporting_docs):
+                if j not in used_supporting:
+                    ordered_items.append(('supporting', sd))
+            # === Number items: skip duplicates ===
+            # 重复发票不分配序号(设为空)，其它项按出现顺序编号
+            non_dup_seq = 0
+            for i, (item_type, item) in enumerate(ordered_items):
+                if item_type == 'invoice' and item.get('is_duplicate'):
+                    item['seq_num'] = ''  # 重复发票不编号
+                else:
+                    non_dup_seq += 1
+                    item['seq_num'] = '%03d' % non_dup_seq
+            # Update duplicate references with seq numbers
+            for inv in invoices:
+                if inv.get('is_duplicate') and inv.get('duplicate_of'):
+                    inv['duplicate_of_seq'] = inv['duplicate_of'].get('seq_num', '')
+                else:
+                    inv['duplicate_of_seq'] = ''
+            # === Compute category summary (excluding duplicates) ===
+            category_summary = {}
+            for inv in invoices:
+                if inv.get('is_duplicate'):
+                    continue
+                cat = inv.get('category', '其他')
+                try:
+                    amt = float(inv.get('amount', 0) or 0)
+                except:
+                    amt = 0
+                category_summary[cat] = round(category_summary.get(cat, 0) + amt, 2)
+            duplicate_count = sum(1 for inv in invoices if inv.get('is_duplicate'))
+            # === Generate Excel ===
+            tasks[task_id].progress = '正在生成Excel表格...'
+            wb = Workbook()
+            ws = wb.active
+            ws.title = '发票信息'
+            headers = ['序号','文件类型','地区','类目','邮件日期','发票日期','发票号码',
+                       '不含税金额','税额','金额','购买方名称','销售方名称',
+                       '对应发票序号','原文件名','新文件名','关联方式','备注']
+            header_font = Font(name='微软雅黑', bold=True, size=11, color='FFFFFF')
+            header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+            header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            thin_border = Border(
+                left=Side(style='thin'), right=Side(style='thin'),
+                top=Side(style='thin'), bottom=Side(style='thin')
+            )
+            for col, h in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col, value=h)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_alignment
+                cell.border = thin_border
+            data_font = Font(name='微软雅黑', size=10)
+            data_alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+            center_alignment = Alignment(horizontal='center', vertical='center')
+            dup_fill = PatternFill(start_color='FEE2E2', end_color='FEE2E2', fill_type='solid')
+            supp_fill = PatternFill(start_color='FEF3C7', end_color='FEF3C7', fill_type='solid')
+            inv_fill = PatternFill(start_color='F0FDF4', end_color='F0FDF4', fill_type='solid')
+            all_rows = []
+            for item_type, item in ordered_items:
+                if item_type == 'invoice':
+                    inv = item
+                    ext = Path(inv['source_file']).suffix.lower()
+                    cat = inv.get('category', '')
+                    dt = inv.get('date', '')
+                    amt = inv.get('amount', '')
+                    is_dup = inv.get('is_duplicate', False)
+                    seq = inv.get('seq_num', '')
+                    if is_dup:
+                        # 重复发票不重命名、不产生新文件名
+                        nfn = ''
+                    else:
+                        nfn = '%s-%s-%s-%s%s' % (seq, cat, dt, amt, ext) if dt and amt else '%s-%s%s' % (seq, cat, ext)
+                    amt_val = amt
+                    try:
+                        amt_val = float(amt)
+                    except:
+                        pass
+                    remark = ''
+                    if is_dup:
+                        remark = '⚠️与序号%s重复，本条不计入' % inv.get('duplicate_of_seq', '')
+                    # 对应发票序号：非重复发票填自身序号；重复发票填原发票序号
+                    corr_seq = inv.get('duplicate_of_seq', '') if is_dup else seq
+                    row_data = [
+                        seq, '发票', inv['region'], cat, inv.get('email_date', ''), dt,
+                        inv['invoice_no'], inv.get('amount_no_tax', ''),
+                        inv.get('tax', ''), amt_val, inv['buyer'], inv['seller'],
+                        corr_seq, inv['source_file'], nfn, '', remark
+                    ]
+                    all_rows.append({'nfn': nfn, 'data': row_data, 'type': 'invoice',
+                                     'source': inv, 'is_duplicate': is_dup})
+                else:
+                    sd = item
+                    ext = Path(sd['source_file']).suffix.lower()
+                    cat = sd.get('type', '')
+                    nfn = '%s-%s%s' % (sd['seq_num'], cat, ext)
+                    related_seq = ''
+                    sd_uid = sd.get('file_uid', '')
+                    for item_type2, item2 in ordered_items:
+                        if item_type2 == 'invoice':
+                            i_uid = item2.get('file_uid', '')
+                            if sd_uid and i_uid and sd_uid == i_uid:
+                                related_seq = item2['seq_num']
+                                break
+                    remark = ''
+                    relation = ''
+                    if related_seq:
+                        remark = '关联发票序号%s' % related_seq
+                        relation = '关联'
+                    row_data = [
+                        sd['seq_num'], sd.get('row_type', '辅助单据'), '', '', sd.get('email_date', ''), '',
+                        '', '', '', '', '', '',
+                        related_seq, sd['source_file'], nfn, relation, remark
+                    ]
+                    all_rows.append({'nfn': nfn, 'data': row_data, 'type': 'supporting', 'source': sd})
+            for i, r in enumerate(all_rows):
+                row = i + 2
+                for col, val in enumerate(r['data'], 1):
+                    cell = ws.cell(row=row, column=col, value=val)
+                    cell.font = data_font
+                    cell.alignment = center_alignment if col in [1,3,4,5,12,15] else data_alignment
+                    cell.border = thin_border
+                    if r.get('is_duplicate'):
+                        cell.fill = dup_fill
+                    elif r['type'] == 'invoice':
+                        cell.fill = inv_fill
+                    elif r['type'] == 'supporting':
+                        cell.fill = supp_fill
+            col_widths = [6, 10, 8, 8, 12, 12, 24, 12, 10, 12, 22, 30, 10, 30, 30, 8, 24]
+            for i, w in enumerate(col_widths):
+                ws.column_dimensions[chr(65 + i)].width = w
+            # === Add category summary sheet ===
+            ws2 = wb.create_sheet('分类汇总')
+            ws2.cell(row=1, column=1, value='类别').font = header_font
+            ws2.cell(row=1, column=2, value='金额(¥)').font = header_font
+            ws2.cell(row=1, column=3, value='占比').font = header_font
+            ws2.cell(row=1, column=4, value='发票数').font = header_font
+            for c in range(1, 5):
+                ws2.cell(row=1, column=c).fill = header_fill
+                ws2.cell(row=1, column=c).alignment = header_alignment
+                ws2.cell(row=1, column=c).border = thin_border
+            total_cat = sum(category_summary.values())
+            inv_count_by_cat = {}
+            for inv in invoices:
+                if inv.get('is_duplicate'):
+                    continue
+                cat = inv.get('category', '其他')
+                inv_count_by_cat[cat] = inv_count_by_cat.get(cat, 0) + 1
+            for i, (cat, amt) in enumerate(sorted(category_summary.items(), key=lambda x: -x[1])):
+                r = i + 2
+                ws2.cell(row=r, column=1, value=cat).border = thin_border
+                ws2.cell(row=r, column=2, value=amt).border = thin_border
+                ws2.cell(row=r, column=2).number_format = '#,##0.00'
+                pct = '%.1f%%' % (amt / total_cat * 100) if total_cat > 0 else '0%'
+                ws2.cell(row=r, column=3, value=pct).border = thin_border
+                ws2.cell(row=r, column=4, value=inv_count_by_cat.get(cat, 0)).border = thin_border
+            total_row = len(category_summary) + 2
+            ws2.cell(row=total_row, column=1, value='合计').font = Font(name='微软雅黑', bold=True, size=11)
+            ws2.cell(row=total_row, column=2, value=total_cat).font = Font(name='微软雅黑', bold=True, size=11)
+            ws2.cell(row=total_row, column=2).number_format = '#,##0.00'
+            ws2.cell(row=total_row, column=3, value='100%').font = Font(name='微软雅黑', bold=True, size=11)
+            ws2.cell(row=total_row, column=4, value=sum(inv_count_by_cat.values())).font = Font(name='微软雅黑', bold=True, size=11)
+            for c in range(1, 5):
+                ws2.cell(row=total_row, column=c).border = thin_border
+            ws2.column_dimensions['A'].width = 16
+            ws2.column_dimensions['B'].width = 16
+            ws2.column_dimensions['C'].width = 10
+            ws2.column_dimensions['D'].width = 10
+            xlsx_path = work_dir / '发票信息统计.xlsx'
+            wb.save(str(xlsx_path))
+            # Copy files to processed dir with new names (skip duplicate invoices)
+            processed_dir = work_dir / 'processed'
+            # Clean processed dir first to avoid stale files
+            if processed_dir.exists():
+                shutil.rmtree(processed_dir)
+            processed_dir.mkdir(parents=True, exist_ok=True)
+            for r in all_rows:
+                new_name = r.get('nfn', '')
+                if not new_name:
+                    # 重复发票没有新文件名，不复制
+                    continue
+                src_name = r['data'][13]
+                src_path = raw_dir / src_name if src_name else None
+                if src_path and src_path.exists():
+                    dst = processed_dir / new_name
+                    c = 1
+                    while dst.exists():
+                        base, ext = new_name.rsplit('.', 1) if '.' in new_name else (new_name, '')
+                        dst = processed_dir / ('%s_%d.%s' % (base, c, ext)) if ext else processed_dir / ('%s_%d' % (base, c))
+                        c += 1
+                    shutil.copy2(str(src_path), str(dst))
+            # Build result
+            total_amount = sum(float(inv.get('amount', 0) or 0) for inv in invoices if not inv.get('is_duplicate'))
+            # Build all_items for frontend display (interleaved)
+            all_items = []
+            for item_type, item in ordered_items:
+                if item_type == 'invoice':
+                    inv = item
+                    remark = ''
+                    if inv.get('is_duplicate'):
+                        remark = '⚠️重复发票，与序号%s重复' % inv.get('duplicate_of_seq', '')
+                    all_items.append({
+                        'seq': inv['seq_num'],
+                        'item_type': 'invoice',
+                        'is_duplicate': inv.get('is_duplicate', False),
+                        'duplicate_of_seq': inv.get('duplicate_of_seq', ''),
+                        'region': inv['region'],
+                        'category': inv['category'],
+                        'date': inv['date'],
+                        'email_date': inv.get('email_date', ''),
+                        'invoice_no': inv['invoice_no'],
+                        'amount': inv['amount'],
+                        'amount_no_tax': inv.get('amount_no_tax', ''),
+                        'tax': inv.get('tax', ''),
+                        'buyer': inv['buyer'],
+                        'seller': inv['seller'],
+                        'remark': remark,
+                        'source_file': inv['source_file'],
+                    })
+                else:
+                    sd = item
+                    related_seq = ''
+                    sd_uid = sd.get('file_uid', '')
+                    for item_type2, item2 in ordered_items:
+                        if item_type2 == 'invoice':
+                            i_uid = item2.get('file_uid', '')
+                            if sd_uid and i_uid and sd_uid == i_uid:
+                                related_seq = item2['seq_num']
+                                break
+                    remark = ''
+                    if related_seq:
+                        remark = '关联发票 #%s' % related_seq
+                    all_items.append({
+                        'seq': sd['seq_num'],
+                        'item_type': 'supporting',
+                        'is_duplicate': False,
+                        'duplicate_of_seq': '',
+                        'region': '',
+                        'category': sd.get('type', ''),
+                        'date': '',
+                        'email_date': sd.get('email_date', ''),
+                        'invoice_no': '',
+                        'amount': '',
+                        'amount_no_tax': '',
+                        'tax': '',
+                        'buyer': '',
+                        'seller': '',
+                        'remark': remark,
+                        'source_file': sd['source_file'],
+                    })
+            result = {
+                'task_id': task_id,
+                'search_info': {
+                    'date_from': date_from,
+                    'date_to': date_to,
+                    'imap_search': search_criteria,
+                    'emails_found': total_emails,
+                    'note': '日期范围筛选的是邮件接收时间（INTERNALDATE），不是发票上的开票日期。如有 2/3 月份的发票出现在结果中，说明这些邮件是 6 月份收到的。',
+                },
+                'total_emails': total_emails,
+                'total_attachments': len(all_attachments),
+                'invoice_count': len(invoices),
+                'duplicate_count': duplicate_count,
+                'supporting_count': len(supporting_docs),
+                'total_amount': round(total_amount, 2),
+                'category_summary': category_summary,
+                'all_items': all_items,
+                'invoices': [
+                    {
+                        'seq': inv['seq_num'], 'invoice_no': inv['invoice_no'],
+                        'date': inv['date'], 'amount': inv['amount'],
+                        'amount_no_tax': inv.get('amount_no_tax', ''),
+                        'tax': inv.get('tax', ''),
+                        'buyer': inv['buyer'], 'seller': inv['seller'],
+                        'region': inv['region'], 'category': inv['category'],
+                        'is_duplicate': inv.get('is_duplicate', False),
+                        'duplicate_of_seq': inv.get('duplicate_of_seq', ''),
+                        'remark': '⚠️重复发票，与序号%s重复' % inv.get('duplicate_of_seq', '') if inv.get('is_duplicate') else '',
+                    } for inv in invoices
+                ],
+                'supporting_docs': [
+                    {
+                        'seq': sd['seq_num'], 'type': sd.get('type', ''),
+                        'source_file': sd['source_file'],
+                    } for sd in supporting_docs
+                ],
+                'no_attach_invoice_emails': [
+                    {
+                        'uid': e['uid'], 'subject': e['subject'],
+                        'from': e['from'], 'invoice_urls': e.get('invoice_urls', []),
+                    } for e in no_attach_invoice_emails[:20]
+                ],
+                'work_dir': str(work_dir),
+            }
+
+            tasks[task_id].status = 'completed'
+            duplicate_count = sum(1 for inv in invoices if inv.get('is_duplicate'))
+            total_amount = sum(float(inv.get('amount', 0) or 0) for inv in invoices if not inv.get('is_duplicate'))
+            tasks[task_id].progress = '完成！共 %d 张发票（含 %d 张重复），%d 个辅助文件，合计 ¥%.2f' % (
+                len(invoices), duplicate_count, len(supporting_docs), total_amount)
+            tasks[task_id].result = result
     except Exception as e:
         tasks[task_id].status = 'failed'
         tasks[task_id].progress = '错误: %s' % str(e)
@@ -794,7 +860,7 @@ def collect_invoices(task_id, config):
 # ===== API Endpoints =====
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "2.2.0"}
 
 @app.post("/api/collect")
 async def start_collection(config: MailConfig, background_tasks: BackgroundTasks):
@@ -896,6 +962,67 @@ async def download_file(task_id: str, filename: str):
         raise HTTPException(status_code=404, detail="文件不存在")
     return FileResponse(str(file_path), filename=filename)
 
+@app.post("/api/task/{task_id}/remove-item")
+async def remove_item(task_id: str, req: RemoveItemRequest):
+    """从任务结果中删除指定单据（发票或辅助单据），重新生成 Excel/ZIP/result。
+    source_file: 要删除的原始文件名
+    item_type: 'invoice' | 'supporting'
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    task = tasks[task_id]
+    if not hasattr(task, 'state') or task.state is None:
+        raise HTTPException(status_code=400, detail="任务状态已丢失，无法编辑")
+    state = task.state
+    invoices = state.get('invoices', [])
+    supporting_docs = state.get('supporting_docs', [])
+    removed = False
+    removed_source = ''
+    if req.item_type == 'invoice':
+        new_invoices = []
+        for inv in invoices:
+            if inv.get('source_file') == req.source_file:
+                removed = True
+                removed_source = inv.get('source_file', '')
+                # 顺便清理引用了此发票的重复发票
+                for inv2 in invoices:
+                    if inv2.get('is_duplicate') and inv2.get('duplicate_of') is inv:
+                        inv2['_to_delete'] = True
+                continue
+            new_invoices.append(inv)
+        # 把引用了已删除发票的重复发票也删掉
+        final_invoices = [inv for inv in new_invoices if not inv.get('_to_delete')]
+        if len(final_invoices) != len(new_invoices):
+            removed = True
+        state['invoices'] = final_invoices
+    elif req.item_type == 'supporting':
+        new_sds = [sd for sd in supporting_docs if sd.get('source_file') != req.source_file]
+        if len(new_sds) != len(supporting_docs):
+            removed = True
+            removed_source = req.source_file
+        state['supporting_docs'] = new_sds
+    else:
+        raise HTTPException(status_code=400, detail="item_type 必须为 invoice 或 supporting")
+    if not removed:
+        raise HTTPException(status_code=404, detail="未找到要删除的单据")
+    # 重新生成 Excel/ZIP/result
+    rebuild_outputs(task_id)
+    return {
+        'success': True,
+        'removed_source': removed_source,
+        'result': task.result,
+    }
+
+@app.get("/api/task/{task_id}/companies")
+async def get_companies(task_id: str):
+    """获取任务涉及的所有购买方名称（用于公司筛选下拉/选择）。"""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    task = tasks[task_id]
+    if not hasattr(task, 'state') or task.state is None:
+        return {"companies": []}
+    return {"companies": task.state.get('all_companies', [])}
+
 # ===== Embedded Frontend =====
 HTML_CONTENT = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -937,6 +1064,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hira
 .btn-outline:hover{background:var(--primary-light)}
 .btn-mini{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;font-size:13px;font-weight:600;color:#fff;background:var(--primary);border-radius:6px;text-decoration:none;transition:all .2s}
 .btn-mini:hover{background:var(--primary-hover);transform:translateY(-1px)}
+.btn-row-delete{background:transparent;border:1px solid #FCA5A5;color:#DC2626;width:30px;height:30px;border-radius:6px;cursor:pointer;font-size:14px;transition:all .2s;display:inline-flex;align-items:center;justify-content:center}
+.btn-row-delete:hover{background:#FEE2E2;border-color:#DC2626;transform:scale(1.05)}
 .progress-bar-container{background:var(--gray-100);border-radius:99px;height:10px;overflow:hidden;margin-bottom:12px}
 .progress-bar{height:100%;background:linear-gradient(90deg,var(--primary),#818CF8);border-radius:99px;transition:width .5s ease;width:0}
 .progress-text{font-size:14px;color:var(--gray-600);text-align:center}
@@ -1059,6 +1188,10 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 <label class="form-label">结束日期</label>
 <input type="date" class="form-input" id="dateTo" required>
 </div>
+<div class="form-group">
+<label class="form-label">按购买方筛选 <span style="font-weight:normal;color:#6B7280;font-size:12px;">（可选，逗号/换行分隔；留空表示不过滤）</span></label>
+<textarea class="form-input" id="companies" rows="2" placeholder="例如：李清博（个人）&#10;郑州方信新材料"></textarea>
+</div>
 </div>
 <div class="security-note">
 <span class="lock-icon">🔒</span>
@@ -1115,7 +1248,7 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 </div>
 <div class="table-container">
 <table>
-<thead><tr><th>序号</th><th>类型</th><th>地区</th><th>类目</th><th>邮件日期</th><th>发票日期</th><th>发票号码</th><th>金额</th><th>购买方</th><th>销售方</th><th>备注</th></tr></thead>
+<thead><tr><th>序号</th><th>类型</th><th>地区</th><th>类目</th><th>邮件日期</th><th>发票日期</th><th>发票号码</th><th>金额</th><th>购买方</th><th>销售方</th><th>备注</th><th>操作</th></tr></thead>
 <tbody id="invoiceTableBody"></tbody>
 </table>
 </div>
@@ -1174,6 +1307,9 @@ const imapHost=document.getElementById('imapHost').value==='custom'
 :document.getElementById('imapHost').value;
 const dateFrom=document.getElementById('dateFrom').value;
 const dateTo=document.getElementById('dateTo').value;
+const companiesRaw=document.getElementById('companies').value.trim();
+// 把 textarea 文本切成多个公司名（支持换行、逗号、中文逗号、分号、空白）
+const companies=companiesRaw?companiesRaw.split(/[\n,，;；、\s]+/).map(function(s){return s.trim();}).filter(Boolean):[];
 if(!email||!authCode||!dateFrom||!dateTo){showToast('请填写所有必填项','error');return;}
 document.getElementById('configCard').style.display='none';
 document.getElementById('progressCard').style.display='block';
@@ -1182,7 +1318,7 @@ try{
 const resp=await fetch(API_BASE+'/api/collect',{
 method:'POST',
 headers:{'Content-Type':'application/json'},
-body:JSON.stringify({email,auth_code:authCode,host:imapHost,port:993,date_from:dateFrom,date_to:dateTo})
+body:JSON.stringify({email,auth_code:authCode,host:imapHost,port:993,date_from:dateFrom,date_to:dateTo,companies:companies})
 });
 if(!resp.ok)throw new Error('请求失败: '+resp.status);
 const data=await resp.json();
@@ -1264,7 +1400,7 @@ let amountCell='-';
 if(item.amount){
 amountCell='<span style="color:#DC2626;font-weight:600;">¥'+item.amount+'</span>';
 }
-tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td style="font-size:12px;color:#6B7280;">'+(item.email_date||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td>';
+tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td style="font-size:12px;color:#6B7280;">'+(item.email_date||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td><td><button class="btn-row-delete" onclick="removeItem(\\''+(item.source_file||'').replace(/'/g,"\\'")+'\\',\\''+item.item_type+'\\')" title="删除此单据">🗑</button></td>';
 tbody.appendChild(tr);
 });
 }else{
@@ -1273,13 +1409,13 @@ result.invoices.forEach(function(inv){
 const tr=document.createElement('tr');
 tr.className=inv.is_duplicate?'duplicate-row':'invoice-row';
 let badge=inv.is_duplicate?'<span class="badge badge-duplicate">重复</span>':'<span class="badge badge-invoice">发票</span>';
-tr.innerHTML='<td style="'+(inv.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(inv.seq||'—')+'</td><td>'+badge+'</td><td>'+inv.region+'</td><td>'+inv.category+'</td><td>'+inv.date+'</td><td style="font-family:monospace;font-size:12px;">'+inv.invoice_no+'</td><td style="color:#DC2626;font-weight:600;">¥'+inv.amount+'</td><td>'+inv.buyer+'</td><td>'+inv.seller+'</td><td style="font-size:12px;color:#DC2626;">'+(inv.remark||'')+'</td>';
+tr.innerHTML='<td style="'+(inv.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(inv.seq||'—')+'</td><td>'+badge+'</td><td>'+inv.region+'</td><td>'+inv.category+'</td><td>'+inv.date+'</td><td style="font-family:monospace;font-size:12px;">'+inv.invoice_no+'</td><td style="color:#DC2626;font-weight:600;">¥'+inv.amount+'</td><td>'+inv.buyer+'</td><td>'+inv.seller+'</td><td style="font-size:12px;color:#DC2626;">'+(inv.remark||'')+'</td><td>-</td>';
 tbody.appendChild(tr);
 });
 result.supporting_docs.forEach(function(sd){
 const tr=document.createElement('tr');
 tr.className='supporting-row';
-tr.innerHTML='<td>'+sd.seq+'</td><td><span class="badge badge-supporting">辅助</span></td><td>-</td><td>'+sd.type+'</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td></td>';
+tr.innerHTML='<td>'+sd.seq+'</td><td><span class="badge badge-supporting">辅助</span></td><td>-</td><td>'+sd.type+'</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td></td><td>-</td>';
 tbody.appendChild(tr);
 });
 }
@@ -1327,6 +1463,33 @@ function downloadAllFiles(){
 if(!currentTaskId)return;
 showToast('正在打包文件，请稍候...','info');
 window.open(API_BASE+'/api/download-all/'+currentTaskId,'_blank');
+}
+async function removeItem(sourceFile,itemType){
+if(!currentTaskId){showToast('没有可编辑的任务','error');return;}
+if(!sourceFile){showToast('缺少文件标识','error');return;}
+const label=itemType==='invoice'?'该发票':'该辅助单据';
+if(!confirm('确认从结果中删除'+label+'？\n文件名：'+sourceFile+'\n\n注：此操作会重新生成 Excel/统计表/文件包（序号会重排）。'))return;
+try{
+showToast('正在删除并重新生成...','info');
+const resp=await fetch(API_BASE+'/api/task/'+currentTaskId+'/remove-item',{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({source_file:sourceFile,item_type:itemType})
+});
+if(!resp.ok){
+const err=await resp.json().catch(function(){return {};});
+throw new Error(err.detail||('请求失败: '+resp.status));
+}
+const data=await resp.json();
+showToast('已删除，序号已重排','success');
+// 用后端返回的最新 result 重新渲染
+if(data.result){
+showResults(data.result);
+}
+}catch(err){
+showToast('删除失败: '+err.message,'error');
+console.error(err);
+}
 }
 function newCollection(){
 currentTaskId=null;
