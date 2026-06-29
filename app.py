@@ -280,9 +280,23 @@ def collect_invoices(task_id, config):
             uid = uid_bytes.decode()
             tasks[task_id].progress = '正在处理邮件 (%d/%d)...' % (i+1, total_emails)
             try:
-                status, fetch_data = imap.uid('fetch', uid, '(BODY.PEEK[])')
-                if status != 'OK':
+                # 一次性获取 INTERNALDATE（邮件接收时间）和邮件正文
+                status, fetch_data = imap.uid('fetch', uid, '(INTERNALDATE BODY.PEEK[])')
+                if status != 'OK' or not fetch_data or not fetch_data[0]:
                     continue
+                meta_raw = fetch_data[0][0]
+                # 解析 INTERNALDATE -> email_date (YYYY-MM-DD)
+                email_date = ''
+                im = re.search(rb'INTERNALDATE "([^"]+)"', meta_raw)
+                if im:
+                    try:
+                        ds = im.group(1).decode()
+                        # 格式形如 " 8-Jun-2026 10:30:45 +0800"
+                        date_part = ds.strip().split(' ')[0]
+                        dt_obj = datetime.strptime(date_part, '%d-%b-%Y')
+                        email_date = dt_obj.strftime('%Y-%m-%d')
+                    except Exception:
+                        email_date = ''
                 msg = email.message_from_bytes(fetch_data[0][1])
                 subject = decode_mime(msg.get('Subject', ''))
                 sender = decode_mime(msg.get('From', ''))
@@ -333,7 +347,7 @@ def collect_invoices(task_id, config):
                     if any(k in u_clean.lower() for k in invoice_url_keywords):
                         invoice_urls.append(u_clean)
                 if attachments:
-                    all_attachments.extend([dict(a, uid=uid, subject=subject) for a in attachments])
+                    all_attachments.extend([dict(a, uid=uid, subject=subject, email_date=email_date) for a in attachments])
                 else:
                     combined = (subject + text_body + html_body).lower()
                     has_invoice_kw = any(kw in combined for kw in
@@ -343,6 +357,7 @@ def collect_invoices(task_id, config):
                     if has_invoice_kw or invoice_urls:
                         no_attach_invoice_emails.append({
                             'uid': uid, 'subject': subject, 'from': sender,
+                            'email_date': email_date,
                             'invoice_urls': invoice_urls[:10],
                         })
             except:
@@ -352,6 +367,13 @@ def collect_invoices(task_id, config):
         invoices = []
         supporting_docs = []
         seen_inv_nos = {}  # inv_no -> first invoice dict
+        # 建立 uid -> email_date 映射，用于在解析附件时获取邮件接收时间
+        uid_to_email_date = {}
+        for a in all_attachments:
+            u = a.get('uid', '')
+            d = a.get('email_date', '')
+            if u and d and u not in uid_to_email_date:
+                uid_to_email_date[u] = d
         for f in sorted(raw_dir.glob('*')):
             fname = f.name
             fpath = str(f)
@@ -368,6 +390,7 @@ def collect_invoices(task_id, config):
                         'source_file': fname, 'source_path': fpath,
                         'type': subtype, 'row_type': '辅助单据',
                         'file_uid': file_uid, 'text_snippet': text[:800],
+                        'email_date': uid_to_email_date.get(file_uid, ''),
                     })
                     continue
                 elif file_type == 'unknown':
@@ -407,6 +430,7 @@ def collect_invoices(task_id, config):
                     'source_file': fname, 'source_path': fpath,
                     'row_type': '发票', 'file_uid': file_uid,
                     'is_duplicate': is_duplicate, 'duplicate_of': duplicate_of_inv,
+                    'email_date': uid_to_email_date.get(file_uid, ''),
                     'text_snippet': text[:800],
                 }
                 invoices.append(inv)
@@ -418,6 +442,7 @@ def collect_invoices(task_id, config):
                         'source_file': fname, 'source_path': fpath,
                         'type': '发票截图', 'row_type': '待确认',
                         'file_uid': file_uid, 'text_snippet': '',
+                        'email_date': uid_to_email_date.get(file_uid, ''),
                     })
         # Sort invoices by date+amount
         invoices.sort(key=lambda x: (x.get('date', '9999-99-99'),
@@ -498,7 +523,7 @@ def collect_invoices(task_id, config):
         wb = Workbook()
         ws = wb.active
         ws.title = '发票信息'
-        headers = ['序号','文件类型','地区','类目','发票日期','发票号码',
+        headers = ['序号','文件类型','地区','类目','邮件日期','发票日期','发票号码',
                    '不含税金额','税额','金额','购买方名称','销售方名称',
                    '对应发票序号','原文件名','新文件名','关联方式','备注']
         header_font = Font(name='微软雅黑', bold=True, size=11, color='FFFFFF')
@@ -546,7 +571,7 @@ def collect_invoices(task_id, config):
                 # 对应发票序号：非重复发票填自身序号；重复发票填原发票序号
                 corr_seq = inv.get('duplicate_of_seq', '') if is_dup else seq
                 row_data = [
-                    seq, '发票', inv['region'], cat, dt,
+                    seq, '发票', inv['region'], cat, inv.get('email_date', ''), dt,
                     inv['invoice_no'], inv.get('amount_no_tax', ''),
                     inv.get('tax', ''), amt_val, inv['buyer'], inv['seller'],
                     corr_seq, inv['source_file'], nfn, '', remark
@@ -572,7 +597,7 @@ def collect_invoices(task_id, config):
                     remark = '关联发票序号%s' % related_seq
                     relation = '关联'
                 row_data = [
-                    sd['seq_num'], sd.get('row_type', '辅助单据'), '', '', '',
+                    sd['seq_num'], sd.get('row_type', '辅助单据'), '', '', sd.get('email_date', ''), '',
                     '', '', '', '', '', '',
                     related_seq, sd['source_file'], nfn, relation, remark
                 ]
@@ -590,7 +615,7 @@ def collect_invoices(task_id, config):
                     cell.fill = inv_fill
                 elif r['type'] == 'supporting':
                     cell.fill = supp_fill
-        col_widths = [6, 10, 8, 8, 12, 24, 12, 10, 12, 22, 30, 10, 30, 30, 8, 24]
+        col_widths = [6, 10, 8, 8, 12, 12, 24, 12, 10, 12, 22, 30, 10, 30, 30, 8, 24]
         for i, w in enumerate(col_widths):
             ws.column_dimensions[chr(65 + i)].width = w
         # === Add category summary sheet ===
@@ -671,6 +696,7 @@ def collect_invoices(task_id, config):
                     'region': inv['region'],
                     'category': inv['category'],
                     'date': inv['date'],
+                    'email_date': inv.get('email_date', ''),
                     'invoice_no': inv['invoice_no'],
                     'amount': inv['amount'],
                     'amount_no_tax': inv.get('amount_no_tax', ''),
@@ -701,6 +727,7 @@ def collect_invoices(task_id, config):
                     'region': '',
                     'category': sd.get('type', ''),
                     'date': '',
+                    'email_date': sd.get('email_date', ''),
                     'invoice_no': '',
                     'amount': '',
                     'amount_no_tax': '',
@@ -712,6 +739,13 @@ def collect_invoices(task_id, config):
                 })
         result = {
             'task_id': task_id,
+            'search_info': {
+                'date_from': config.date_from,
+                'date_to': config.date_to,
+                'imap_search': search_criteria,
+                'emails_found': total_emails,
+                'note': '日期范围筛选的是邮件接收时间（INTERNALDATE），不是发票上的开票日期。如有 2/3 月份的发票出现在结果中，说明这些邮件是 6 月份收到的。',
+            },
             'total_emails': total_emails,
             'total_attachments': len(all_attachments),
             'invoice_count': len(invoices),
@@ -941,6 +975,13 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 .email-alert ul{list-style:disc;padding-left:20px;font-size:14px;color:var(--gray-700)}
 .email-alert li{margin-bottom:4px}
 .email-alert a{color:var(--primary);text-decoration:underline}
+.search-info-banner{background:linear-gradient(135deg,#EFF6FF 0%,#DBEAFE 100%);border:1px solid #93C5FD;border-radius:var(--radius-sm);padding:14px 18px;margin-bottom:20px;font-size:13px;color:var(--gray-700)}
+.search-info-title{font-weight:600;color:#1E40AF;margin-bottom:8px;font-size:14px}
+.search-info-row{margin-bottom:4px;display:flex;align-items:center;flex-wrap:wrap;gap:4px}
+.search-info-label{color:var(--gray-600);font-weight:500}
+.search-info-banner code{background:rgba(30,64,175,.1);color:#1E40AF;padding:2px 6px;border-radius:4px;font-family:monospace;font-size:12px}
+.search-info-tip{margin-top:8px;padding:8px 10px;background:rgba(255,255,255,.6);border-radius:6px;color:#1E3A8A;line-height:1.5}
+.search-info-tip strong{color:#1E40AF}
 .steps{display:flex;justify-content:center;gap:8px;margin-bottom:32px}
 .step{display:flex;align-items:center;gap:8px;padding:8px 16px;border-radius:99px;font-size:14px;font-weight:500;background:rgba(255,255,255,.15);color:rgba(255,255,255,.6);transition:all .3s}
 .step.active{background:rgba(255,255,255,.25);color:#fff}
@@ -1042,6 +1083,13 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 <div class="stat-card"><div class="stat-value" id="statSupporting">0</div><div class="stat-label">辅助文件</div></div>
 <div class="stat-card"><div class="stat-value red" id="statAmount">¥0</div><div class="stat-label">发票总额</div></div>
 </div>
+<div id="searchInfoBanner" class="search-info-banner fade-in" style="display:none">
+<div class="search-info-title">🔍 搜索条件与说明</div>
+<div class="search-info-row"><span class="search-info-label">邮件日期范围：</span><span id="searchInfoRange">-</span></div>
+<div class="search-info-row"><span class="search-info-label">IMAP 搜索语句：</span><code id="searchInfoCiteria">-</code></div>
+<div class="search-info-row"><span class="search-info-label">实际找到邮件：</span><span id="searchInfoFound">-</span></div>
+<div class="search-info-tip">💡 日期范围筛选的是<strong>邮件接收时间</strong>（即 IMAP INTERNALDATE），不是发票上的开票日期。表格中"邮件日期"列才是筛选依据。如有 2/3 月份的发票出现，说明这些邮件是 6 月份收到的。</div>
+</div>
 <div id="categorySection" style="display:none" class="card fade-in">
 <div class="card-title"><span class="icon icon-green">💰</span>分类金额汇总</div>
 <div class="category-grid" id="categoryGrid"></div>
@@ -1067,7 +1115,7 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 </div>
 <div class="table-container">
 <table>
-<thead><tr><th>序号</th><th>类型</th><th>地区</th><th>类目</th><th>日期</th><th>发票号码</th><th>金额</th><th>购买方</th><th>销售方</th><th>备注</th></tr></thead>
+<thead><tr><th>序号</th><th>类型</th><th>地区</th><th>类目</th><th>邮件日期</th><th>发票日期</th><th>发票号码</th><th>金额</th><th>购买方</th><th>销售方</th><th>备注</th></tr></thead>
 <tbody id="invoiceTableBody"></tbody>
 </table>
 </div>
@@ -1169,6 +1217,13 @@ document.getElementById('statInvoices').textContent=result.invoice_count;
 document.getElementById('statDuplicates').textContent=result.duplicate_count||0;
 document.getElementById('statSupporting').textContent=result.supporting_count;
 document.getElementById('statAmount').textContent='¥'+result.total_amount.toLocaleString('zh-CN',{minimumFractionDigits:2});
+// 显示搜索条件信息
+if(result.search_info){
+document.getElementById('searchInfoBanner').style.display='block';
+document.getElementById('searchInfoRange').textContent=result.search_info.date_from+' ~ '+result.search_info.date_to;
+document.getElementById('searchInfoCiteria').textContent=result.search_info.imap_search;
+document.getElementById('searchInfoFound').textContent=result.search_info.emails_found+' 封';
+}
 // Render category summary
 if(result.category_summary&&Object.keys(result.category_summary).length>0){
 document.getElementById('categorySection').style.display='block';
@@ -1209,7 +1264,7 @@ let amountCell='-';
 if(item.amount){
 amountCell='<span style="color:#DC2626;font-weight:600;">¥'+item.amount+'</span>';
 }
-tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td>';
+tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td style="font-size:12px;color:#6B7280;">'+(item.email_date||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td>';
 tbody.appendChild(tr);
 });
 }else{
