@@ -237,25 +237,37 @@ def extract_buyer(text, default_buyer=''):
     """提取购买方名称。兼容多种格式：
     - 购方名称 / 购货方名称 / 购买方名称 / 购 名称
     - 名称：xxx（在没有 销/售 上下文时作为 fallback）
+    - 「购买方信息」+ 「名称：xxx」区块
     """
-    # 1. 直接匹配 "购...名称："（兼容 购买方/购方/购货方 等前缀）
-    m = re.search(r'购[买货方销售元]*\s*名\s*称[：:\s]*([^\n\r]{4,40})', text)
+    # 1. 直接匹配 "购...名称："（兼容 购买方/购方/购货方/购买方信息 等前缀）。
+    #    关键：capture group 必须停在"销/售"或"纳税人识别号/统一社会信用代码"等关键字前，
+    #         避免把销方或无关信息也吃进来。
+    m = re.search(
+        r'购[买货方]*\s*(?:信息\s*)?名\s*称[：:\s]+'
+        r'([^销售\n\r]{4,40}?)'
+        r'(?=[销售\n\r]|统一社会|纳税人|信用代码|开户行|账号|地址电话|$)',
+        text
+    )
     if m:
-        b = re.sub(r'\s+', '', m.group(1).strip())
+        b = m.group(1).strip()
+        b = re.sub(r'\s+', '', b)
         # 去掉统一社会信用代码、纳税人识别号等尾部信息
         b = re.sub(r'(统一社会|纳税人|信用代码|开户行|账号|地址电话).*$', '', b).strip()
         if len(b) >= 4 and ('公司' in b or '个人' in b or len(b) >= 6):
             return b
-    # 2. 找 "购方信息" / "购买方信息" 区块内的 "名称：xxx"
-    in_buyer_section = False
+    # 2. 区块式扫描：行级状态机，"购买方/购货方" → buyer section，"销售方/销方" → seller section
+    in_section = None
     for line in text.split('\n'):
-        if '购方' in line or '购买方' in line or '购货方' in line:
-            in_buyer_section = True
-        if in_buyer_section and re.match(r'^\s*名\s*称[：:\s]', line):
-            m2 = re.match(r'\s*名\s*称[：:\s]*(.+)', line)
+        if any(kw in line for kw in ['购买方', '购货方']):
+            in_section = 'buyer'
+        elif any(kw in line for kw in ['销售方', '销方', '售方', '销货方']):
+            in_section = 'seller'
+        if in_section == 'buyer':
+            m2 = re.match(r'\s*名\s*称[：:\s]+(.+)', line)
             if m2:
-                b = re.sub(r'\s+', '', m2.group(1).strip())
-                b = re.sub(r'(统一社会|纳税人|信用代码).*$', '', b).strip()
+                b = m2.group(1).strip()
+                b = re.sub(r'\s+', '', b)
+                b = re.sub(r'(统一社会|纳税人|信用代码|开户行|账号|地址电话).*$', '', b).strip()
                 if len(b) >= 4:
                     return b
     return default_buyer
@@ -829,11 +841,17 @@ def collect_invoices(task_id, config):
                     fd = re.search(r'(\d{4}).(\d{2}).(\d{2})', fname)
                     if fd:
                         date_val = '%s-%s-%s' % (fd.group(1), fd.group(2), fd.group(3))
-                # 若关键字段都为空，认为未识别
-                if not buyer and not seller and not amount and not inv_no:
+                # 若关键字段缺失，认为未识别（归为"字段缺失-待确认"）
+                # 判定条件：金额为空 OR (购买方和销售方都为空)
+                # 注：inv_no 不参与判定（行程单 OCR 能匹配到印刷编号但其它字段都空）
+                if not amount or (not buyer and not seller):
+                    missing = []
+                    if not amount: missing.append('金额')
+                    if not buyer: missing.append('购买方')
+                    if not seller: missing.append('销售方')
                     unknown_files.append({
                         'filename': fname,
-                        'reason': 'PDF 解析后关键字段全空（购买方/销售方/金额/号码）',
+                        'reason': 'PDF 解析后关键字段缺失（%s）' % '/'.join(missing),
                         'email_date': _file_email_date,
                         'file_uid': file_uid,
                     })
