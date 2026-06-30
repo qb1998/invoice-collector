@@ -12,7 +12,7 @@
 运行方式: python app.py
 然后浏览器打开 http://localhost:8000
 """
-import os, re, json, ssl, socket, imaplib, email, hashlib, shutil, tempfile, asyncio, sys, zipfile, io
+import os, re, json, ssl, socket, imaplib, email, hashlib, shutil, tempfile, asyncio, sys, zipfile, io, time
 from pathlib import Path
 from datetime import datetime, timedelta
 from email.header import decode_header
@@ -109,33 +109,33 @@ def parse_pdf(fpath):
         return 'ERROR: %s' % e
 
 def extract_seller(text, buyer_name=''):
-    m = re.search(r'销\s*名称[：:\s]*([^\n\r]{4,60})', text)
+    """提取销售方名称。兼容多种格式：
+    - 销方名称 / 销货方名称 / 销售方名称 / 售方名称 / 销 名称
+    - 名称：xxx（在 销/售 区块内）
+    """
+    # 1. 直接匹配 "销...名称："（兼容 销售方/销方/销货方 等前缀）
+    m = re.search(r'销[售货方费]*\s*名\s*称[：:\s]*([^\n\r]{4,60})', text)
     if m:
         s = re.sub(r'\s+', '', m.group(1).strip())
         s = re.sub(r'(统一社会|纳税人识别号).*$', '', s).strip()
         if len(s) >= 4 and not any(h in s for h in ['规格型号', '单位', '数量', '单价']):
             if not buyer_name or s != buyer_name:
                 return s
-    m = re.search(r'售\s*名称[：:\s]*([^\n\r]{4,60})', text)
-    if m:
-        s = re.sub(r'\s+', '', m.group(1).strip())
-        s = re.sub(r'(统一社会|纳税人识别号).*$', '', s).strip()
-        if len(s) >= 4 and not any(h in s[:8] for h in ['规格型号']):
-            if not buyer_name or s != buyer_name:
-                return s
-    lines = text.split('\n')
+    # 2. 找 "销方信息" / "销售方信息" 区块内的 "名称：xxx"
     in_sell_section = False
-    for i, line in enumerate(lines):
-        if '销' in line or '售方' in line:
+    for line in text.split('\n'):
+        if '销方' in line or '销售方' in line or '售方' in line or '销货方' in line:
             in_sell_section = True
-        if in_sell_section and re.match(r'^\s*名称[：:\s]', line):
-            m2 = re.match(r'\s*名称[：:\s]*(.+)', line)
+        if in_sell_section and re.match(r'^\s*名\s*称[：:\s]', line):
+            m2 = re.match(r'\s*名\s*称[：:\s]*(.+)', line)
             if m2:
-                s = m2.group(1).strip()
+                s = re.sub(r'\s+', '', m2.group(1).strip())
+                s = re.sub(r'(统一社会|纳税人识别号).*$', '', s).strip()
                 if len(s) >= 4 and (not buyer_name or s != buyer_name):
                     return s
+    # 3. fallback: 找所有 "名称：xxx" 中的最后一个非 buyer
     all_names = []
-    for m3 in re.finditer(r'名称[：:\s]*([^\n\r]{4,50})', text):
+    for m3 in re.finditer(r'名\s*称[：:\s]*([^\n\r]{4,50})', text):
         n = re.sub(r'\s+', '', m3.group(1).strip())
         n = re.sub(r'(统一社会|纳税人).*$', '', n).strip()
         if any(h in n[:6] for h in ['规格型号', '单位数量']):
@@ -169,12 +169,30 @@ def extract_subtotal_tax(text):
     return '', ''
 
 def extract_buyer(text, default_buyer=''):
-    m = re.search(r'购\s*名称[：:\s]*([^\n\r销售]{4,40})', text)
+    """提取购买方名称。兼容多种格式：
+    - 购方名称 / 购货方名称 / 购买方名称 / 购 名称
+    - 名称：xxx（在没有 销/售 上下文时作为 fallback）
+    """
+    # 1. 直接匹配 "购...名称："（兼容 购买方/购方/购货方 等前缀）
+    m = re.search(r'购[买货方销售元]*\s*名\s*称[：:\s]*([^\n\r]{4,40})', text)
     if m:
         b = re.sub(r'\s+', '', m.group(1).strip())
-        b = re.sub(r'(统一社会|纳税人).*$', '', b).strip()
-        if len(b) >= 4:
+        # 去掉统一社会信用代码、纳税人识别号等尾部信息
+        b = re.sub(r'(统一社会|纳税人|信用代码|开户行|账号|地址电话).*$', '', b).strip()
+        if len(b) >= 4 and ('公司' in b or '个人' in b or len(b) >= 6):
             return b
+    # 2. 找 "购方信息" / "购买方信息" 区块内的 "名称：xxx"
+    in_buyer_section = False
+    for line in text.split('\n'):
+        if '购方' in line or '购买方' in line or '购货方' in line:
+            in_buyer_section = True
+        if in_buyer_section and re.match(r'^\s*名\s*称[：:\s]', line):
+            m2 = re.match(r'\s*名\s*称[：:\s]*(.+)', line)
+            if m2:
+                b = re.sub(r'\s+', '', m2.group(1).strip())
+                b = re.sub(r'(统一社会|纳税人|信用代码).*$', '', b).strip()
+                if len(b) >= 4:
+                    return b
     return default_buyer
 
 def determine_region(seller):
@@ -279,23 +297,46 @@ def collect_invoices(task_id, config):
             tasks[task_id].result = {
                 'total_emails': 0, 'invoices': [], 'supporting_docs': [],
                 'all_items': [], 'total_amount': 0, 'category_summary': {},
-                'no_attach_invoice_emails': []
+                'no_attach_invoice_emails': [],
+                'skipped_emails': [], 'failed_pdfs': [], 'unknown_files': []
             }
             imap.logout()
             return
         all_attachments = []
         no_attach_invoice_emails = []
+        skipped_emails = []  # 抓取/解析失败的邮件
+        failed_pdfs = []  # PDF 解析失败（被记录，不丢弃原始文件）
+        unknown_files = []  # 无法识别的文件（降级为待确认辅助单据）
         for i, uid_bytes in enumerate(uids):
             uid = uid_bytes.decode()
             tasks[task_id].progress = '正在处理邮件 (%d/%d)...' % (i+1, total_emails)
+            subject = ''
+            sender = ''
+            email_date = ''
             try:
                 # 一次性获取 INTERNALDATE（邮件接收时间）和邮件正文
-                status, fetch_data = imap.uid('fetch', uid, '(INTERNALDATE BODY.PEEK[])')
-                if status != 'OK' or not fetch_data or not fetch_data[0]:
+                fetch_data = None
+                fetch_error = ''
+                # 重试 2 次：避免瞬时网络抖动漏抓
+                for attempt in range(3):
+                    try:
+                        status, fd = imap.uid('fetch', uid, '(INTERNALDATE BODY.PEEK[])')
+                        if status == 'OK' and fd and fd[0]:
+                            fetch_data = fd
+                            break
+                        fetch_error = 'fetch 返回非 OK: %s' % status
+                    except Exception as _e:
+                        fetch_error = 'fetch 异常: %s' % str(_e)[:200]
+                    if attempt < 2:
+                        time.sleep(1.0 * (attempt + 1))
+                if fetch_data is None:
+                    skipped_emails.append({
+                        'uid': uid, 'subject': '(无法获取)', 'email_date': '',
+                        'reason': fetch_error or 'fetch 失败'
+                    })
                     continue
                 meta_raw = fetch_data[0][0]
                 # 解析 INTERNALDATE -> email_date (YYYY-MM-DD)
-                email_date = ''
                 im = re.search(rb'INTERNALDATE "([^"]+)"', meta_raw)
                 if im:
                     try:
@@ -305,13 +346,26 @@ def collect_invoices(task_id, config):
                         dt_obj = datetime.strptime(date_part, '%d-%b-%Y')
                         email_date = dt_obj.strftime('%Y-%m-%d')
                     except Exception:
-                        email_date = ''
-                msg = email.message_from_bytes(fetch_data[0][1])
-                subject = decode_mime(msg.get('Subject', ''))
-                sender = decode_mime(msg.get('From', ''))
+                        pass
+                try:
+                    msg = email.message_from_bytes(fetch_data[0][1])
+                except Exception as _e:
+                    skipped_emails.append({
+                        'uid': uid, 'subject': '(无法解析 MIME)', 'email_date': email_date,
+                        'reason': 'MIME 解析失败: %s' % str(_e)[:120]
+                    })
+                    continue
+                subject = decode_mime(msg.get('Subject', '')) if msg else ''
+                sender = decode_mime(msg.get('From', '')) if msg else ''
                 attachments = []
                 html_body = ''
                 text_body = ''
+                if not msg:
+                    skipped_emails.append({
+                        'uid': uid, 'subject': subject, 'email_date': email_date,
+                        'reason': '邮件内容为空'
+                    })
+                    continue
                 for part in msg.walk():
                     if part.is_multipart():
                         continue
@@ -322,11 +376,20 @@ def collect_invoices(task_id, config):
                         payload = part.get_payload(decode=True)
                         if not payload:
                             continue
-                    except:
+                    except Exception:
                         continue
-                    if fn or 'attachment' in cd.lower():
-                        decoded_fn = decode_mime(fn) if fn else 'attachment_%s' % uid
+                    # 处理附件：包括 explicit attachment / inline with filename / 纯 PDF
+                    is_attachment = (
+                        'attachment' in cd.lower()
+                        or (fn is not None and fn != '')
+                        or ct == 'application/pdf'
+                        or ct.startswith('image/') and ('发票' in fn or 'invoice' in fn.lower() if fn else False)
+                    )
+                    if is_attachment:
+                        decoded_fn = decode_mime(fn) if fn else 'attachment_%s.%s' % (uid, ct.split('/')[-1] or 'bin')
                         safe_name = re.sub(r'[^\w\u4e00-\u9fff.\-]', '_', decoded_fn)
+                        if not safe_name or safe_name == '_' or safe_name.startswith('.'):
+                            safe_name = 'file_%s_%02d' % (uid, len(attachments))
                         out_name = '%s_%02d_%s' % (uid, len(attachments), safe_name)
                         out_path = raw_dir / out_name
                         counter = 1
@@ -342,13 +405,21 @@ def collect_invoices(task_id, config):
                             'size': len(payload),
                         })
                     elif ct == 'text/html':
-                        html_body = payload.decode('utf-8', errors='replace')
+                        try:
+                            html_body = payload.decode('utf-8', errors='replace')
+                        except Exception:
+                            pass
                     elif ct == 'text/plain':
-                        text_body = payload.decode('utf-8', errors='replace')
+                        try:
+                            text_body = payload.decode('utf-8', errors='replace')
+                        except Exception:
+                            pass
                 urls = re.findall(r'https?://[^\s"\'<>]+', html_body)
                 invoice_url_keywords = [
                     'fapiao', 'invoice', 'download', 'pdf', 'fp.', 'dppt', 'bwjf',
-                    'chinatax', 'fpjx', 'e-invoice', 'qrcode', 'ewm', 'dzfp'
+                    'chinatax', 'fpjx', 'e-invoice', 'qrcode', 'ewm', 'dzfp',
+                    'meituan', 'ele.me', 'dianping', 'ctrip', 'fliggy', 'qunar',
+                    '12306', 'alipay', 'weixin', 'qq.com', 'tencent',
                 ]
                 invoice_urls = []
                 for u in urls:
@@ -369,8 +440,14 @@ def collect_invoices(task_id, config):
                             'email_date': email_date,
                             'invoice_urls': invoice_urls[:10],
                         })
-            except:
-                continue
+            except Exception as _e:
+                # 顶层兜底：单封邮件出错不导致整个任务失败，但要记下来
+                import traceback as _tb
+                skipped_emails.append({
+                    'uid': uid, 'subject': subject or '(未知)', 'email_date': email_date,
+                    'reason': '处理异常: %s' % str(_e)[:120],
+                    'traceback': _tb.format_exc()[:500]
+                })
         imap.logout()
         tasks[task_id].progress = '已下载 %d 个附件，正在解析发票...' % len(all_attachments)
         invoices = []
@@ -387,9 +464,24 @@ def collect_invoices(task_id, config):
             fname = f.name
             fpath = str(f)
             file_uid = extract_uid_from_filename(fname)
+            _file_email_date = uid_to_email_date.get(file_uid, '')
             if f.suffix.lower() == '.pdf':
                 text = parse_pdf(fpath)
                 if text.startswith('ERROR'):
+                    # PDF 解析失败：记录到 failed_pdfs，但保留 raw 文件供用户下载查看
+                    failed_pdfs.append({
+                        'filename': fname,
+                        'error': text[6:].strip()[:200],  # 去掉 'ERROR:' 前缀
+                        'email_date': _file_email_date,
+                        'file_uid': file_uid,
+                    })
+                    # 仍然放进 supporting_docs，用户可下载查看
+                    supporting_docs.append({
+                        'source_file': fname, 'source_path': fpath,
+                        'type': 'PDF解析失败', 'row_type': '待确认',
+                        'file_uid': file_uid, 'text_snippet': '',
+                        'email_date': _file_email_date,
+                    })
                     continue
                 file_type, subtype = classify_file(fname, text)
                 if file_type == 'skip':
@@ -399,10 +491,23 @@ def collect_invoices(task_id, config):
                         'source_file': fname, 'source_path': fpath,
                         'type': subtype, 'row_type': '辅助单据',
                         'file_uid': file_uid, 'text_snippet': text[:800],
-                        'email_date': uid_to_email_date.get(file_uid, ''),
+                        'email_date': _file_email_date,
                     })
                     continue
                 elif file_type == 'unknown':
+                    # 不再丢弃：保存为"未识别"待确认辅助单据，让用户可下载查看
+                    unknown_files.append({
+                        'filename': fname,
+                        'reason': 'PDF 内容无法识别为发票或辅助单据',
+                        'email_date': _file_email_date,
+                        'file_uid': file_uid,
+                    })
+                    supporting_docs.append({
+                        'source_file': fname, 'source_path': fpath,
+                        'type': '未识别-待确认', 'row_type': '待确认',
+                        'file_uid': file_uid, 'text_snippet': text[:800],
+                        'email_date': _file_email_date,
+                    })
                     continue
                 inv_no_m = re.search(r'发票号码[：:\s]*(\d+)', text)
                 if not inv_no_m:
@@ -430,6 +535,21 @@ def collect_invoices(task_id, config):
                     fd = re.search(r'(\d{4}).(\d{2}).(\d{2})', fname)
                     if fd:
                         date_val = '%s-%s-%s' % (fd.group(1), fd.group(2), fd.group(3))
+                # 若关键字段都为空，认为未识别
+                if not buyer and not seller and not amount and not inv_no:
+                    unknown_files.append({
+                        'filename': fname,
+                        'reason': 'PDF 解析后关键字段全空（购买方/销售方/金额/号码）',
+                        'email_date': _file_email_date,
+                        'file_uid': file_uid,
+                    })
+                    supporting_docs.append({
+                        'source_file': fname, 'source_path': fpath,
+                        'type': '字段缺失-待确认', 'row_type': '待确认',
+                        'file_uid': file_uid, 'text_snippet': text[:800],
+                        'email_date': _file_email_date,
+                    })
+                    continue
                 category = determine_category(seller, text)
                 region = determine_region(seller)
                 inv = {
@@ -439,7 +559,7 @@ def collect_invoices(task_id, config):
                     'source_file': fname, 'source_path': fpath,
                     'row_type': '发票', 'file_uid': file_uid,
                     'is_duplicate': is_duplicate, 'duplicate_of': duplicate_of_inv,
-                    'email_date': uid_to_email_date.get(file_uid, ''),
+                    'email_date': _file_email_date,
                     'text_snippet': text[:800],
                 }
                 invoices.append(inv)
@@ -451,7 +571,7 @@ def collect_invoices(task_id, config):
                         'source_file': fname, 'source_path': fpath,
                         'type': '发票截图', 'row_type': '待确认',
                         'file_uid': file_uid, 'text_snippet': '',
-                        'email_date': uid_to_email_date.get(file_uid, ''),
+                        'email_date': _file_email_date,
                     })
         # Sort invoices by date+amount
         invoices.sort(key=lambda x: (x.get('date', '9999-99-99'),
@@ -483,8 +603,21 @@ def collect_invoices(task_id, config):
             'date_to': config.date_to,
             'search_criteria': search_criteria,
             'total_emails': total_emails,
+            'processed_uids': [u.decode() for u in uids],  # 已处理邮件 UID 列表（含失败但尝试过）
             'no_attach_invoice_emails': no_attach_invoice_emails,
+            'skipped_emails': skipped_emails,
+            'failed_pdfs': failed_pdfs,
+            'unknown_files': unknown_files,
         }
+        # 更新进度，让用户看到完整统计
+        warn = []
+        if skipped_emails: warn.append('跳过 %d 封邮件' % len(skipped_emails))
+        if failed_pdfs: warn.append('%d 个 PDF 解析失败' % len(failed_pdfs))
+        if unknown_files: warn.append('%d 个文件未识别' % len(unknown_files))
+        warn_suffix = (' | ⚠️ ' + '，'.join(warn)) if warn else ''
+        tasks[task_id].progress = '已下载 %d 个附件，已识别 %d 张发票%s' % (
+            len(all_attachments), len(invoices), warn_suffix
+        )
         # === Generate Excel/ZIP/result via reusable function ===
         rebuild_outputs(task_id)
         return
@@ -842,6 +975,28 @@ def rebuild_outputs(task_id):
                         'from': e['from'], 'invoice_urls': e.get('invoice_urls', []),
                     } for e in no_attach_invoice_emails[:20]
                 ],
+                'skipped_emails': [
+                    {
+                        'uid': e.get('uid', ''),
+                        'subject': e.get('subject', ''),
+                        'email_date': e.get('email_date', ''),
+                        'reason': e.get('reason', ''),
+                    } for e in state.get('skipped_emails', [])
+                ],
+                'failed_pdfs': [
+                    {
+                        'filename': p.get('filename', ''),
+                        'error': p.get('error', ''),
+                        'email_date': p.get('email_date', ''),
+                    } for p in state.get('failed_pdfs', [])
+                ],
+                'unknown_files': [
+                    {
+                        'filename': u.get('filename', ''),
+                        'reason': u.get('reason', ''),
+                        'email_date': u.get('email_date', ''),
+                    } for u in state.get('unknown_files', [])
+                ],
                 'work_dir': str(work_dir),
             }
 
@@ -1104,6 +1259,12 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 .email-alert ul{list-style:disc;padding-left:20px;font-size:14px;color:var(--gray-700)}
 .email-alert li{margin-bottom:4px}
 .email-alert a{color:var(--primary);text-decoration:underline}
+.skipped-alert{background:#FEE2E2;border:1.5px solid #DC2626;border-radius:var(--radius-sm);padding:14px 16px;margin-bottom:12px}
+.skipped-alert h4{color:#991B1B;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.skipped-alert .alert-body{font-size:13px;color:#7F1D1D;max-height:240px;overflow-y:auto;background:#fff;border:1px solid #FECACA;border-radius:6px;padding:8px 10px;margin-top:8px}
+.skipped-alert .alert-body .row{padding:4px 0;border-bottom:1px dashed #FEE2E2}
+.skipped-alert .alert-body .row:last-child{border-bottom:none}
+.skipped-alert code{background:#FEE2E2;padding:1px 4px;border-radius:3px;font-size:12px;color:#7F1D1D}
 .search-info-banner{background:linear-gradient(135deg,#EFF6FF 0%,#DBEAFE 100%);border:1px solid #93C5FD;border-radius:var(--radius-sm);padding:14px 18px;margin-bottom:20px;font-size:13px;color:var(--gray-700)}
 .search-info-title{font-weight:600;color:#1E40AF;margin-bottom:8px;font-size:14px}
 .search-info-row{margin-bottom:4px;display:flex;align-items:center;flex-wrap:wrap;gap:4px}
@@ -1257,6 +1418,27 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 <h4>⚠️ 发现无附件的发票邮件</h4>
 <p style="margin-bottom:8px;font-size:14px;">以下邮件包含发票信息但无附件，可能需要手动下载：</p>
 <ul id="emailAlertList"></ul>
+</div>
+</div>
+<div id="skippedEmailsSection" style="display:none">
+<div class="skipped-alert fade-in">
+<h4>🚫 跳过的邮件（<span id="skippedCount">0</span> 封）</h4>
+<p style="font-size:13px;color:#7F1D1D;margin-bottom:4px;">以下邮件在抓取/解析过程中出错，未被收集。请检查邮箱设置或网络后重新收集，或联系开发排查：</p>
+<div class="alert-body" id="skippedEmailsList"></div>
+</div>
+</div>
+<div id="failedPdfsSection" style="display:none">
+<div class="skipped-alert fade-in">
+<h4>📄 PDF 解析失败（<span id="failedPdfsCount">0</span> 个）</h4>
+<p style="font-size:13px;color:#7F1D1D;margin-bottom:4px;">以下 PDF 文件因加密、扫描件或格式问题无法提取文字，已作为「待确认」辅助单据保留在文件包中，可手动查看：</p>
+<div class="alert-body" id="failedPdfsList"></div>
+</div>
+</div>
+<div id="unknownFilesSection" style="display:none">
+<div class="skipped-alert fade-in" style="background:#FEF3C7;border-color:#D97706">
+<h4 style="color:#92400E;">❓ 未识别的文件（<span id="unknownFilesCount">0</span> 个）</h4>
+<p style="font-size:13px;color:#78350F;margin-bottom:4px;">以下文件无法识别为发票或常见辅助单据，已作为「待确认」辅助单据保留。请人工检查是否为相关单据：</p>
+<div class="alert-body" id="unknownFilesList" style="background:#fff;border-color:#FDE68A"></div>
 </div>
 </div>
 <div class="card fade-in">
@@ -1492,9 +1674,58 @@ li.innerHTML=html;
 ul.appendChild(li);
 });
 }
+// 跳过的邮件
+if(result.skipped_emails&&result.skipped_emails.length>0){
+document.getElementById('skippedEmailsSection').style.display='block';
+document.getElementById('skippedCount').textContent=result.skipped_emails.length;
+const body=document.getElementById('skippedEmailsList');
+body.innerHTML='';
+result.skipped_emails.forEach(function(e){
+const row=document.createElement('div');
+row.className='row';
+row.innerHTML='<strong>UID '+e.uid+'</strong>'
++(e.email_date?' <code>'+e.email_date+'</code>':'')
++'<br>主题: '+e.subject
++'<br>原因: <code>'+(e.reason||'未知')+'</code>';
+body.appendChild(row);
+});
+}
+// PDF 解析失败
+if(result.failed_pdfs&&result.failed_pdfs.length>0){
+document.getElementById('failedPdfsSection').style.display='block';
+document.getElementById('failedPdfsCount').textContent=result.failed_pdfs.length;
+const body=document.getElementById('failedPdfsList');
+body.innerHTML='';
+result.failed_pdfs.forEach(function(p){
+const row=document.createElement('div');
+row.className='row';
+row.innerHTML='<strong>'+p.filename+'</strong>'
++(p.email_date?' <code>'+p.email_date+'</code>':'')
++'<br>错误: <code>'+(p.error||'未知')+'</code>';
+body.appendChild(row);
+});
+}
+// 未识别的文件
+if(result.unknown_files&&result.unknown_files.length>0){
+document.getElementById('unknownFilesSection').style.display='block';
+document.getElementById('unknownFilesCount').textContent=result.unknown_files.length;
+const body=document.getElementById('unknownFilesList');
+body.innerHTML='';
+result.unknown_files.forEach(function(u){
+const row=document.createElement('div');
+row.className='row';
+row.innerHTML='<strong>'+u.filename+'</strong>'
++(u.email_date?' <code>'+u.email_date+'</code>':'')
++'<br>原因: '+(u.reason||'未知');
+body.appendChild(row);
+});
+}
 loadFilesList();
 var msg='收集完成！共'+result.invoice_count+'张发票';
 if(result.duplicate_count>0)msg+='（含'+result.duplicate_count+'张重复）';
+if(result.skipped_emails&&result.skipped_emails.length>0)msg+='，⚠️ 跳过 '+result.skipped_emails.length+' 封邮件';
+if(result.failed_pdfs&&result.failed_pdfs.length>0)msg+='，⚠️ '+result.failed_pdfs.length+' 个 PDF 失败';
+if(result.unknown_files&&result.unknown_files.length>0)msg+='，⚠️ '+result.unknown_files.length+' 个文件未识别';
 showToast(msg,'success');
 }
 async function loadFilesList(){
@@ -1558,6 +1789,9 @@ document.getElementById('progressCard').style.display='none';
 document.getElementById('resultSection').style.display='none';
 document.getElementById('categorySection').style.display='none';
 document.getElementById('emailAlertSection').style.display='none';
+document.getElementById('skippedEmailsSection').style.display='none';
+document.getElementById('failedPdfsSection').style.display='none';
+document.getElementById('unknownFilesSection').style.display='none';
 document.getElementById('progressBar').style.width='0%';
 setStep(1);
 }
