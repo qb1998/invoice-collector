@@ -1125,6 +1125,12 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 .toast-success{background:var(--success)}
 .toast-error{background:var(--danger)}
 .toast-info{background:var(--primary)}
+.error-box{display:none;margin-top:16px;padding:16px 18px;background:#FEF2F2;border:1.5px solid #FCA5A5;border-radius:var(--radius-sm);color:#991B1B}
+.error-box.show{display:block}
+.error-box-title{font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.error-box-msg{font-size:13px;line-height:1.6;word-break:break-all}
+.error-box-hint{margin-top:10px;padding-top:10px;border-top:1px dashed #FCA5A5;font-size:12px;color:#7F1D1D}
+.error-box-hint b{color:#991B1B}
 .security-note{background:var(--primary-light);border-radius:var(--radius-sm);padding:14px 16px;margin-top:16px;display:flex;gap:10px;align-items:flex-start;font-size:13px;color:var(--gray-600)}
 .security-note .lock-icon{font-size:18px;flex-shrink:0;margin-top:1px}
 @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
@@ -1206,7 +1212,21 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 <div class="card-title"><span class="icon icon-blue">⏳</span>正在收集发票</div>
 <div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div>
 <div class="progress-text" id="progressText">正在连接邮箱...</div>
-<div style="text-align:center;margin-top:20px;"><div class="spinner"></div></div>
+<div style="text-align:center;margin-top:20px;"><div class="spinner" id="progressSpinner"></div></div>
+<div class="error-box" id="errorBox">
+<div class="error-box-title">⚠️ 收集失败</div>
+<div class="error-box-msg" id="errorBoxMsg"></div>
+<div class="error-box-hint">
+<b>常见原因：</b><br>
+• 授权码错误（请到邮箱设置中获取<b>IMAP授权码</b>，不是登录密码）<br>
+• 邮箱未开启 IMAP 服务（需在网页版邮箱设置中开启）<br>
+• 网络/防火墙拦截（公司/校园网可能屏蔽 993 端口）<br>
+• 邮箱地址与 IMAP 服务器不匹配（如 163 邮箱选了 QQ 服务器）<br>
+</div>
+<div style="margin-top:14px;text-align:center;">
+<button type="button" class="btn btn-primary" onclick="backToConfig()" style="padding:10px 24px;font-size:14px;">↩ 重新填写</button>
+</div>
+</div>
 </div>
 <div id="resultSection" style="display:none">
 <div class="stats-grid fade-in">
@@ -1311,6 +1331,10 @@ const companiesRaw=document.getElementById('companies').value.trim();
 // 把 textarea 文本切成多个公司名（支持换行、逗号、中文逗号、分号、空白）
 const companies=companiesRaw?companiesRaw.split(/[\n,，;；、\s]+/).map(function(s){return s.trim();}).filter(Boolean):[];
 if(!email||!authCode||!dateFrom||!dateTo){showToast('请填写所有必填项','error');return;}
+const startBtn=document.getElementById('startBtn');
+startBtn.disabled=true;
+startBtn.textContent='⏳ 正在创建任务...';
+document.getElementById('errorBox').classList.remove('show');
 document.getElementById('configCard').style.display='none';
 document.getElementById('progressCard').style.display='block';
 setStep(2);
@@ -1320,16 +1344,16 @@ method:'POST',
 headers:{'Content-Type':'application/json'},
 body:JSON.stringify({email,auth_code:authCode,host:imapHost,port:993,date_from:dateFrom,date_to:dateTo,companies:companies})
 });
-if(!resp.ok)throw new Error('请求失败: '+resp.status);
+if(!resp.ok){
+const errText=await resp.text().catch(()=>resp.statusText);
+throw new Error('HTTP '+resp.status+': '+errText);
+}
 const data=await resp.json();
 currentTaskId=data.task_id;
 pollInterval=setInterval(pollStatus,2000);
 showToast('任务已创建，正在收集...','info');
 }catch(err){
-showToast('启动失败: '+err.message,'error');
-document.getElementById('configCard').style.display='block';
-document.getElementById('progressCard').style.display='none';
-setStep(1);
+showStartError('启动任务失败',err.message);
 }
 }
 async function pollStatus(){
@@ -1341,9 +1365,42 @@ const progressMap={'pending':5,'running':50,'completed':100,'failed':100};
 const pct=progressMap[data.status]||0;
 document.getElementById('progressBar').style.width=pct+'%';
 document.getElementById('progressText').textContent=data.progress;
-if(data.status==='completed'){clearInterval(pollInterval);showResults(data.result);setStep(3);}
-else if(data.status==='failed'){clearInterval(pollInterval);showToast('收集失败: '+data.progress,'error');document.getElementById('configCard').style.display='block';document.getElementById('progressCard').style.display='none';setStep(1);}
+if(data.status==='completed'){clearInterval(pollInterval);resetStartBtn();showResults(data.result);setStep(3);}
+else if(data.status==='failed'){
+clearInterval(pollInterval);
+document.getElementById('progressText').textContent='❌ ' + data.progress;
+showErrorBox(data.progress);
+showToast('收集失败，请查看下方详情','error');
+}
 }catch(err){console.error('Poll error:',err);}
+}
+function showErrorBox(errMsg){
+const box=document.getElementById('errorBox');
+const msg=document.getElementById('errorBoxMsg');
+msg.textContent=errMsg;
+box.classList.add('show');
+}
+function showStartError(title,detail){
+resetStartBtn();
+document.getElementById('progressCard').style.display='none';
+document.getElementById('configCard').style.display='block';
+setStep(1);
+showErrorBox(title+'：'+detail);
+setTimeout(()=>{document.getElementById('errorBox').classList.remove('show');},8000);
+}
+function resetStartBtn(){
+const btn=document.getElementById('startBtn');
+btn.disabled=false;
+btn.textContent='🚀 开始收集发票';
+}
+function backToConfig(){
+clearInterval(pollInterval);
+currentTaskId=null;
+document.getElementById('progressCard').style.display='none';
+document.getElementById('configCard').style.display='block';
+document.getElementById('errorBox').classList.remove('show');
+setStep(1);
+resetStartBtn();
 }
 function showResults(result){
 document.getElementById('progressCard').style.display='none';
