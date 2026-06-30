@@ -171,7 +171,7 @@ def parse_pdf(fpath):
         ocr_text = _ocr_pdf_with_vision(fpath)
         if ocr_text.strip() and len(ocr_text.strip()) > len(text.strip()):
             text = ocr_text
-    return text
+    return normalize_ocr_text(text)
 
 def extract_seller(text, buyer_name=''):
     """提取销售方名称。兼容多种格式：
@@ -347,6 +347,10 @@ def classify_file(filename, text):
     # === 5b. 文件名兜底：含「电子行程单」+ 订单号（航司电子发票 PDF 多为此种命名）===
     if '电子行程单' in filename and ('订单' in filename or '航' in filename or '机票' in filename):
         return ('invoice', '机票行程单')
+    # === 5c. 携程/航旅纵横等 OTA 的「行程单」（Booking No. + 航班 + 旅客，**无金额**）===
+    if any(kw in text for kw in ['Trip.com', 'trip.com', '携程', 'Booking No.', '航旅纵横', '航班管家']):
+        if any(kw in text for kw in ['Itinerary', 'Itinerar', '行程单', '航班信息', 'Flight Information', 'Booking Information', '预订信息', '订单编号']):
+            return ('invoice', '机票行程单-OTA')
     # === 6. 文件名兜底：含「行程单」+ 铁路/车次关键词 ===
     if '行程单' in filename and any(kw in filename for kw in ['火车', '高铁', '动车', '12306']):
         return ('invoice', '火车票')
@@ -426,7 +430,84 @@ def parse_air_itinerary(text):
     return seller, date_val, amount, remark
 
 
-def parse_train_ticket(text):
+def parse_ota_itinerary(text, filename=''):
+    """解析携程/Trip.com/航旅纵横等 OTA 行程单。
+    返回 (seller, date, amount, remark)。**注意：OTA 行程单通常不含金额**，amount 返回空。
+    """
+    # OCR 后冒号常被识别为 ∶ (U+2236) 或 ：(U+FF1A)，统一规范化
+    _COLON = r'[：:∶]'
+    # 1. 销售方：优先航司，其次 OTA 平台
+    seller = ''
+    # 先找航司
+    m = re.search(r'(?:航司|Airline)[/\s' + _COLON + r']*\n?\s*([^\n\r]{2,30}?)(?:\n|$)', text)
+    if m:
+        airline = m.group(1).strip()
+        # 去重 "Airline XXX" 这种情况
+        airline = re.sub(r'^[A-Za-z\s/]+', '', airline).strip()
+        if airline:
+            seller = airline
+    if not seller:
+        # 文件名兜底
+        for kw in ['中国南方航空', '南方航空', '国航', '东航', '海航', '厦航', '深航']:
+            if kw in text or kw in filename:
+                seller = kw
+                break
+    if not seller:
+        for kw in ['携程', 'Trip.com', '航旅纵横', '航班管家']:
+            if kw in text or kw in filename:
+                seller = kw
+                break
+    if not seller:
+        seller = 'OTA行程单'
+    # 2. 日期：第一个出发日期
+    date_val = ''
+    # 英文 "Departure 15:45, July 17, 2026"（冒号可能是 U+2236）
+    m = re.search(r'Departure\s+\d{1,2}\D{0,2}\d{2},\s+(\w+)\s+(\d{1,2}),\s+(\d{4})', text)
+    if m:
+        months = {'January': 1, 'February': 2, 'March': 3, 'April': 4, 'May': 5, 'June': 6,
+                  'July': 7, 'August': 8, 'September': 9, 'October': 10, 'November': 11, 'December': 12}
+        mo = months.get(m.group(1), 0)
+        if mo:
+            date_val = '%s-%02d-%02d' % (m.group(3), mo, int(m.group(2)))
+    if not date_val:
+        # 中文 "2026年7月17日15:45"
+        m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', text)
+        if m:
+            date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    if not date_val:
+        # 兜底 "2026-07-17"
+        m = re.search(r'(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})', text)
+        if m:
+            date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    # 3. 金额：OTA 行程单无金额，留空
+    amount = ''
+    # 4. 备注：旅客名、票号、订单号、航班号
+    remark_parts = []
+    m = re.search(r'(?:订单编号|Booking\s*No\.?)\s*(\d{10,20})', text)
+    if m:
+        remark_parts.append('订单 ' + m.group(1))
+    m = re.search(r'(?:E-?ticket\s*No\.?|票号)\s*(\d{3}-?\d{10,15})', text)
+    if m:
+        remark_parts.append('票号 ' + m.group(1))
+    m = re.search(r'(?:Airline\s*Booking\s*Reference|航司预订编码)\s*\n?\s*([A-Z0-9]{4,8})', text)
+    if m:
+        val = m.group(1)
+        # 排除把旅客姓名（QINGBO/LI QINGBO）误识别为预订编码的情况
+        if val not in ('QINGBO', 'QINGBO LI', 'LI QINGBO') and not re.match(r'^[A-Z]+\s+[A-Z]+$', val):
+            remark_parts.append('预订编码 ' + val)
+    # 航班号
+    flights = re.findall(r'\b([A-Z]{2})\s*(\d{3,4})\b', text)
+    seen = set()
+    flight_strs = []
+    for code, num in flights[:8]:
+        key = code + num
+        if key not in seen and code in ('CZ', 'CA', 'MU', 'HU', 'MF', 'ZH', '3U', 'GS', 'G5', 'FM', 'NS', 'BK', 'JD'):
+            seen.add(key)
+            flight_strs.append(code + num)
+    if flight_strs:
+        remark_parts.append('航班 ' + '/'.join(flight_strs[:3]))
+    remark = ' '.join(remark_parts)
+    return seller, date_val, amount, remark
     """解析火车票/高铁票。
     返回 (seller, date, amount, remark)。
     """
@@ -538,6 +619,45 @@ def parse_didi_receipt(text):
         remark_parts.append('→' + m.group(1).strip())
     remark = ' '.join(remark_parts)
     return seller, date_val, amount, remark
+
+
+# OCR 常见字符替换映射（Kangxi Radicals 等容易出错）
+_OCR_CHAR_MAP = {
+    '⽉': '月',  # U+2F49
+    '⽇': '日',  # U+2F47
+    '⼀': '一',  # U+2F00
+    '⽤': '用',  # U+2F64
+    '⽅': '方',  # U+2F5D
+    '⾏': '行',  # U+2F0F
+    '⻓': '长',  # U+2EE8
+    '⻘': '青',  # U+2ED8
+    '⻔': '门',  # U+2ED4
+    '⻩': '黄',  # U+2EE9
+    '⽆': '无',
+    '⼈': '人',
+    '⼆': '二',
+    '∶': ':',  # U+2236 ratio 冒号
+}
+
+
+def normalize_ocr_text(text):
+    """规范化 OCR 后的常见错字（Kangxi Radicals、半角/全角符号）。"""
+    if not text:
+        return text
+    _map = {
+        '⽉': '月', '⽇': '日', '⼀': '一', '⽤': '用', '⽅': '方',
+        '⾏': '行', '⻓': '长', '⻘': '青', '⻔': '门', '⻩': '黄',
+        '⽆': '无', '⼈': '人', '⼆': '二', '∶': ':',
+        '：': ':',  # U+FF1A fullwidth 冒号
+        '，': ',',  # U+FF0C fullwidth 逗号
+        '（': '(',  # U+FF08 fullwidth 左括号
+        '）': ')',  # U+FF09 fullwidth 右括号
+    }
+    for src, dst in _map.items():
+        if src in text:
+            text = text.replace(src, dst)
+    return text
+
 
 def extract_uid_from_filename(filename):
     """Extract IMAP UID from saved filename (format: {uid}_{index}_{name})."""
@@ -792,6 +912,8 @@ def collect_invoices(task_id, config):
                 _special_remark = ''
                 if subtype == '机票行程单':
                     sp_seller, sp_date, sp_amount, sp_remark = parse_air_itinerary(text)
+                elif subtype == '机票行程单-OTA':
+                    sp_seller, sp_date, sp_amount, sp_remark = parse_ota_itinerary(text, fname)
                 elif subtype == '火车票':
                     sp_seller, sp_date, sp_amount, sp_remark = parse_train_ticket(text)
                 elif subtype == '网约车发票':
@@ -806,6 +928,13 @@ def collect_invoices(task_id, config):
                     m = re.search(r'NO[\.：:\s]*\s*([A-Z0-9]{6,15})', text, re.IGNORECASE)
                     if m:
                         inv_no = m.group(1)
+                    else:
+                        inv_no = ''
+                elif not inv_no_m and subtype == '机票行程单-OTA':
+                    # OTA 行程单用订单号作 inv_no（可能有票号）
+                    m = re.search(r'(?:Booking\s*No\.?|订单编号)\s*(\d{10,20})', text)
+                    if m:
+                        inv_no = 'OTA-' + m.group(1)
                     else:
                         inv_no = ''
                 else:
@@ -1420,18 +1549,26 @@ async def list_files(task_id: str):
     return {"files": files}
 
 @app.get("/api/file/{task_id}/{filename:path}")
-async def download_file(task_id: str, filename: str):
+async def download_file(task_id: str, filename: str, inline: int = 0):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="任务不存在")
     task = tasks[task_id]
-    if task.status != 'completed' or not task.result:
-        raise HTTPException(status_code=400, detail="任务未完成")
-    work_dir = Path(task.result['work_dir'])
+    # 支持未完成的任务预览（用户在结果页展开文件预览）
+    if not hasattr(task, 'state') or task.state is None:
+        raise HTTPException(status_code=400, detail="任务状态已丢失")
+    state = task.state
+    work_dir = Path(state['work_dir'])
+    # 安全检查：filename 不能包含 ..
+    if '..' in filename or filename.startswith('/'):
+        raise HTTPException(status_code=400, detail="非法文件名")
     file_path = work_dir / 'processed' / filename
     if not file_path.exists():
         file_path = work_dir / 'raw' / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="文件不存在")
+    # inline=1 时浏览器内联预览（PDF 用浏览器内置查看器）
+    if inline:
+        return FileResponse(str(file_path), filename=filename, content_disposition_type='inline')
     return FileResponse(str(file_path), filename=filename)
 
 @app.post("/api/task/{task_id}/remove-item")
@@ -1758,6 +1895,20 @@ tbody tr.duplicate-row:hover{background:#FECACA !important}
 <div class="alert-body" id="unknownFilesList" style="background:#fff;border-color:#FDE68A"></div>
 </div>
 </div>
+
+<!-- PDF/图片预览模态框 -->
+<div id="previewModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;justify-content:center;align-items:center;">
+<div style="background:#fff;width:90%;max-width:1100px;height:90%;border-radius:8px;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.4);">
+<div style="padding:12px 16px;border-bottom:1px solid #E5E7EB;display:flex;justify-content:space-between;align-items:center;">
+<div id="previewModalTitle" style="font-weight:600;color:#1F2937;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;margin-right:12px;"></div>
+<div style="display:flex;gap:8px;align-items:center;">
+<a id="previewDownloadLink" href="#" target="_blank" rel="noopener" style="color:#2563EB;text-decoration:none;font-size:13px;padding:4px 8px;">⬇ 下载</a>
+<button onclick="closePreview()" style="background:#F3F4F6;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:14px;color:#6B7280;">✕ 关闭</button>
+</div>
+</div>
+<div id="previewModalBody" style="flex:1;overflow:auto;background:#F9FAFB;display:flex;justify-content:center;align-items:flex-start;padding:8px;"></div>
+</div>
+</div>
 <div class="card fade-in">
 <div class="card-title"><span class="icon icon-green">📊</span>发票详情</div>
 <div class="legend">
@@ -1901,6 +2052,45 @@ document.getElementById('errorBox').classList.remove('show');
 setStep(1);
 resetStartBtn();
 }
+// ====== PDF/图片预览模态框 ======
+function openPreview(filename){
+if(!filename||!currentTaskId){return;}
+const modal=document.getElementById('previewModal');
+const body=document.getElementById('previewModalBody');
+const title=document.getElementById('previewModalTitle');
+const dl=document.getElementById('previewDownloadLink');
+title.textContent=filename;
+const encoded=encodeURIComponent(filename);
+const url=API_BASE+'/api/file/'+currentTaskId+'/'+encoded+'?inline=1';
+const dlUrl=API_BASE+'/api/file/'+currentTaskId+'/'+encoded;
+dl.href=dlUrl;
+dl.setAttribute('download',filename);
+// 判断文件类型
+const lower=filename.toLowerCase();
+body.innerHTML='<div style="padding:40px;color:#6B7280;">加载中...</div>';
+if(lower.endsWith('.pdf')){
+// 浏览器内置 PDF 查看器
+body.innerHTML='<iframe src="'+url+'" style="width:100%;height:100%;border:0;background:#fff;" title="'+filename.replace(/"/g,'&quot;')+'"></iframe>';
+}else if(lower.match(/\.(png|jpg|jpeg|gif|webp|bmp)$/)){
+body.innerHTML='<img src="'+url+'" style="max-width:100%;max-height:100%;object-fit:contain;" alt="'+filename.replace(/"/g,'&quot;')+'" />';
+}else{
+// 其它文件类型：显示下载链接
+body.innerHTML='<div style="padding:40px;text-align:center;"><p style="color:#6B7280;margin-bottom:16px;">该文件类型不支持在线预览，请下载查看：</p><a href="'+dlUrl+'" target="_blank" rel="noopener" download="'+filename.replace(/"/g,'&quot;')+'" style="display:inline-block;padding:8px 20px;background:#2563EB;color:#fff;border-radius:4px;text-decoration:none;">⬇ 下载 '+filename+'</a></div>';
+}
+modal.style.display='flex';
+// ESC 键关闭
+const escHandler=function(e){if(e.key==='Escape'){closePreview();document.removeEventListener('keydown',escHandler);}};
+document.addEventListener('keydown',escHandler);
+// 点击背景关闭
+modal.onclick=function(e){if(e.target===modal){closePreview();}};
+}
+function closePreview(){
+const modal=document.getElementById('previewModal');
+modal.style.display='none';
+modal.onclick=null;
+const body=document.getElementById('previewModalBody');
+body.innerHTML='';
+}
 function showResults(result){
 document.getElementById('progressCard').style.display='none';
 document.getElementById('resultSection').style.display='block';
@@ -1956,9 +2146,11 @@ let amountCell='-';
 if(item.amount){
 amountCell='<span style="color:#DC2626;font-weight:600;">¥'+item.amount+'</span>';
 }
-tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td style="font-size:12px;color:#6B7280;">'+(item.email_date||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td><td><button class="btn-row-delete" data-source="'+(item.source_file||'').replace(/"/g,'&quot;')+'" data-type="'+item.item_type+'" title="删除此单据">🗑</button></td>';
+tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td style="font-size:12px;color:#6B7280;">'+(item.email_date||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td><td style="white-space:nowrap;"><button class="btn-row-preview" data-source="'+(item.source_file||'').replace(/"/g,'&quot;')+'" data-fname="'+(item.source_file||'').replace(/"/g,'&quot;')+'" title="预览文件" style="background:#DBEAFE;border:1px solid #93C5FD;color:#1E40AF;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:12px;margin-right:4px;">👁</button><button class="btn-row-delete" data-source="'+(item.source_file||'').replace(/"/g,'&quot;')+'" data-type="'+item.item_type+'" title="删除此单据" style="background:#FEE2E2;border:1px solid #FCA5A5;color:#991B1B;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:12px;">🗑</button></td>';
 const delBtn=tr.querySelector('.btn-row-delete');
 if(delBtn){delBtn.addEventListener('click',function(){removeItem(this.getAttribute('data-source')||'',this.getAttribute('data-type')||'');});}
+const previewBtn=tr.querySelector('.btn-row-preview');
+if(previewBtn){previewBtn.addEventListener('click',function(){openPreview(this.getAttribute('data-fname')||'');});}
 tbody.appendChild(tr);
 });
 }else{
@@ -1967,13 +2159,21 @@ result.invoices.forEach(function(inv){
 const tr=document.createElement('tr');
 tr.className=inv.is_duplicate?'duplicate-row':'invoice-row';
 let badge=inv.is_duplicate?'<span class="badge badge-duplicate">重复</span>':'<span class="badge badge-invoice">发票</span>';
-tr.innerHTML='<td style="'+(inv.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(inv.seq||'—')+'</td><td>'+badge+'</td><td>'+inv.region+'</td><td>'+inv.category+'</td><td>'+inv.date+'</td><td style="font-family:monospace;font-size:12px;">'+inv.invoice_no+'</td><td style="color:#DC2626;font-weight:600;">¥'+inv.amount+'</td><td>'+inv.buyer+'</td><td>'+inv.seller+'</td><td style="font-size:12px;color:#DC2626;">'+(inv.remark||'')+'</td><td>-</td>';
+const _sf=inv.source_file||'';
+const _sfEsc=_sf.replace(/"/g,'&quot;');
+tr.innerHTML='<td style="'+(inv.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(inv.seq||'—')+'</td><td>'+badge+'</td><td>'+inv.region+'</td><td>'+inv.category+'</td><td>'+inv.date+'</td><td style="font-family:monospace;font-size:12px;">'+inv.invoice_no+'</td><td style="color:#DC2626;font-weight:600;">¥'+inv.amount+'</td><td>'+inv.buyer+'</td><td>'+inv.seller+'</td><td style="font-size:12px;color:#DC2626;">'+(inv.remark||'')+'</td><td style="white-space:nowrap;"><button class="btn-row-preview" data-fname="'+_sfEsc+'" title="预览" style="background:#DBEAFE;border:1px solid #93C5FD;color:#1E40AF;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:12px;margin-right:4px;">👁</button>-</td>';
+const pbtn=tr.querySelector('.btn-row-preview');
+if(pbtn){pbtn.addEventListener('click',function(){openPreview(this.getAttribute('data-fname')||'');});}
 tbody.appendChild(tr);
 });
 result.supporting_docs.forEach(function(sd){
 const tr=document.createElement('tr');
 tr.className='supporting-row';
-tr.innerHTML='<td>'+sd.seq+'</td><td><span class="badge badge-supporting">辅助</span></td><td>-</td><td>'+sd.type+'</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td></td><td>-</td>';
+const _sf=sd.source_file||'';
+const _sfEsc=_sf.replace(/"/g,'&quot;');
+tr.innerHTML='<td>'+sd.seq+'</td><td><span class="badge badge-supporting">辅助</span></td><td>-</td><td>'+sd.type+'</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td></td><td style="white-space:nowrap;"><button class="btn-row-preview" data-fname="'+_sfEsc+'" title="预览" style="background:#DBEAFE;border:1px solid #93C5FD;color:#1E40AF;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:12px;">👁</button>-</td>';
+const pbtn=tr.querySelector('.btn-row-preview');
+if(pbtn){pbtn.addEventListener('click',function(){openPreview(this.getAttribute('data-fname')||'');});}
 tbody.appendChild(tr);
 });
 }
@@ -2016,9 +2216,15 @@ body.innerHTML='';
 result.failed_pdfs.forEach(function(p){
 const row=document.createElement('div');
 row.className='row';
-row.innerHTML='<strong>'+p.filename+'</strong>'
+const _fnEsc=(p.filename||'').replace(/"/g,'&quot;');
+row.innerHTML='<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">'
++'<div style="flex:1;"><strong>'+p.filename+'</strong>'
 +(p.email_date?' <code>'+p.email_date+'</code>':'')
-+'<br>错误: <code>'+(p.error||'未知')+'</code>';
++'<br>错误: <code>'+(p.error||'未知')+'</code></div>'
++'<button class="btn-row-preview" data-fname="'+_fnEsc+'" title="预览文件" style="background:#DBEAFE;border:1px solid #93C5FD;color:#1E40AF;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:12px;white-space:nowrap;">👁 预览</button>'
++'</div>';
+const pbtn=row.querySelector('.btn-row-preview');
+if(pbtn){pbtn.addEventListener('click',function(){openPreview(this.getAttribute('data-fname')||'');});}
 body.appendChild(row);
 });
 }
@@ -2031,9 +2237,15 @@ body.innerHTML='';
 result.unknown_files.forEach(function(u){
 const row=document.createElement('div');
 row.className='row';
-row.innerHTML='<strong>'+u.filename+'</strong>'
+const _fnEsc=(u.filename||'').replace(/"/g,'&quot;');
+row.innerHTML='<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">'
++'<div style="flex:1;"><strong>'+u.filename+'</strong>'
 +(u.email_date?' <code>'+u.email_date+'</code>':'')
-+'<br>原因: '+(u.reason||'未知');
++'<br>原因: '+(u.reason||'未知')+'</div>'
++'<button class="btn-row-preview" data-fname="'+_fnEsc+'" title="预览文件" style="background:#DBEAFE;border:1px solid #93C5FD;color:#1E40AF;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:12px;white-space:nowrap;">👁 预览</button>'
++'</div>';
+const pbtn=row.querySelector('.btn-row-preview');
+if(pbtn){pbtn.addEventListener('click',function(){openPreview(this.getAttribute('data-fname')||'');});}
 body.appendChild(row);
 });
 }
@@ -2050,6 +2262,7 @@ if(!currentTaskId)return;
 try{
 const resp=await fetch(API_BASE+'/api/files/'+currentTaskId);
 const data=await resp.json();
+
 const container=document.getElementById('filesList');
 if(!data.files||data.files.length===0){container.innerHTML='<p style="color:var(--gray-400);">暂无文件</p>';return;}
 let html='<div style="display:grid;grid-template-columns:1fr auto auto;gap:6px 12px;font-size:13px;align-items:center;">';
