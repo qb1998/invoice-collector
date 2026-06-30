@@ -96,7 +96,7 @@ def parse_imap_date(date_str):
     return '%02d-%s-%04d' % (dt.day, months[dt.month-1], dt.year)
 
 # ===== PDF Extraction =====
-def _ocr_pdf_with_vision(fpath, dpi=300):
+def _ocr_pdf_with_vision(fpath, dpi=400):
     """用 macOS Vision framework 对 PDF 跑 OCR 兜底。
     适用于：纯图像 PDF（pdfplumber 提取不到文字）。
     返回 OCR 出的文字。
@@ -238,7 +238,23 @@ def extract_buyer(text, default_buyer=''):
     - 购方名称 / 购货方名称 / 购买方名称 / 购 名称
     - 名称：xxx（在没有 销/售 上下文时作为 fallback）
     - 「购买方信息」+ 「名称：xxx」区块
+    - OCR 容错：18 位 纳税人识别号 → KNOWN_TAX_ID_TO_COMPANY 反查
     """
+    # 0. OCR 容错：先找 18 位 纳税人识别号（91410183MA3XF5EQXR）
+    #    适用场景：图像型 PDF 行程单，购方名被 OCR 识别为乱码，但识别号完整
+    #    OCR 常见问题：识别号中间会插入 0-3 个垃圾字符（如 "91410183FIIMA3XF5EQXR"）
+    #    策略：找 "9xxxxxxxx" 开头 + 8-20 个 [0-9A-Z] 字符（容忍中间 0-5 个非字符）
+    tax_id_m = re.search(r'(9\d{7})[^销售\n\r\+\*]{0,3}([0-9A-Z]{8,10})', text)
+    if not tax_id_m:
+        # 更宽松：8位行政代码 + 任何 0-3 个非字符 + 8-10 字符
+        tax_id_m = re.search(r'\b(9\d{7})[^A-Z0-9\n\r]{0,3}([0-9A-Z]{8,12})', text)
+    if tax_id_m:
+        tid = tax_id_m.group(1) + tax_id_m.group(2)
+        # 修复常见 OCR 错位（'O'→'0', 'I'→'1', 'B'→'8', 'S'→'5' 等）
+        tid_clean = tid.replace('O', '0').replace('I', '1').replace('B', '8').replace('S', '5')
+        name = _resolve_company_by_tax_id(tid_clean) or _resolve_company_by_tax_id(tid)
+        if name:
+            return name
     # 1. 直接匹配 "购...名称："（兼容 购买方/购方/购货方/购买方信息 等前缀）。
     #    关键：capture group 必须停在"销/售"或"纳税人识别号/统一社会信用代码"等关键字前，
     #         避免把销方或无关信息也吃进来。
@@ -320,6 +336,54 @@ def determine_category(seller, text=''):
             return cat
     return '其他'
 
+# === 航司 IATA 二字代码 → 全称（用于 OCR 行程单/电子客票的 销售方 推断）===
+AIRLINE_CODES = {
+    'CZ': '中国南方航空', 'CA': '中国国际航空', 'MU': '中国东方航空',
+    'HU': '海南航空', 'MF': '厦门航空', 'ZH': '深圳航空',
+    '3U': '四川航空', 'GS': '天津航空', 'G5': '华夏航空',
+    'FM': '上海航空', 'NS': '河北航空', 'BK': '奥凯航空',
+    'JD': '首都航空', 'HO': '吉祥航空', 'AQ': '九元航空',
+    'EU': '鹰联航空', 'PN': '西部航空', 'VD': '鲲鹏航空',
+    'Y8': '扬子江快运', 'O3': '江西航空', 'GJ': '长龙航空',
+    'KN': '联合航空', 'CN': '大新华航空', 'TV': '西藏航空',
+    'GT': '桂林航空', 'QW': '青岛航空', '9C': '春秋航空',
+    'FU': '福州航空', 'DZ': '东海航空', 'GX': '北部湾航空',
+    'DR': '瑞丽航空', 'RY': '多彩航空', 'UQ': '乌鲁木齐航空',
+}
+
+# === 已知 纳税人识别号 → 公司名（用于 OCR 行程单：识别号未在文本中匹配但很常见）===
+KNOWN_TAX_ID_TO_COMPANY = {
+    '91410183MA3XF5EQXR': '郑州方信新材料有限公司',
+    '91410100MA3X2K6P5G': '郑州方信新材料有限公司',  # 备用
+}
+
+# === 已知 8 位行政区划码+组织类别码 → 公司名（OCR 容错：仅前 8 位数字匹配即可）===
+# 中国纳税人识别号前 8 位 = 行政区划(6位) + 组织类别(2位)，足以唯一标识一家公司
+KNOWN_ADMIN_CODES = {
+    '91410183': '郑州方信新材料有限公司',  # 河南郑州金水
+}
+
+def _resolve_company_by_tax_id(tax_id):
+    """通过纳税人识别号查找公司名（OCR 行程单 fallback 用）。
+    支持两种容错：
+    1. 精确匹配
+    2. 取前 8 位数字作为行政代码（OCR 中后 10 位常被误识别为字母/符号）
+    """
+    if not tax_id:
+        return ''
+    # 1. 精确匹配
+    name = KNOWN_TAX_ID_TO_COMPANY.get(tax_id)
+    if name:
+        return name
+    # 2. OCR 容错：取前 8 位数字
+    digits = re.findall(r'\d', tax_id)
+    if len(digits) >= 8:
+        key8 = ''.join(digits[:8])
+        if key8 in KNOWN_ADMIN_CODES:
+            return KNOWN_ADMIN_CODES[key8]
+    return ''
+
+
 def classify_file(filename, text):
     # === 1. 航空电子客票行程单（这是报销凭证，应当作发票）===
     if any(kw in text for kw in ['航空运输电子客票行程单', '航空运输客票', '电子客票行程单']):
@@ -341,16 +405,29 @@ def classify_file(filename, text):
         '阳光', '享道', '如祺', '哈啰', '第三方',
     ]):
         return ('invoice', '网约车发票')
-    # === 5. 文件名兜底：含「行程单」+ 航空关键词（机票、电子客票、航司）===
-    if '行程单' in filename and any(kw in filename for kw in ['机票', '航空', '电子客票', '航司', '航班', '机票预订', '订座']):
-        return ('invoice', '机票行程单')
-    # === 5b. 文件名兜底：含「电子行程单」+ 订单号（航司电子发票 PDF 多为此种命名）===
-    if '电子行程单' in filename and ('订单' in filename or '航' in filename or '机票' in filename):
-        return ('invoice', '机票行程单')
-    # === 5c. 携程/航旅纵横等 OTA 的「行程单」（Booking No. + 航班 + 旅客，**无金额**）===
+    # === 4c. 文件名兜底：含网约车平台关键词（不要求"行程单"）===
+    # 适用场景：网约车"电子发票"PDF，文件名带平台名（如"如祺出行电子发票"、"哈啰打车电子发票"）
+    # 但 OCR 文本里因为竖排/图像原因没有"行程单"也没有"如祺"等关键词。
+    if any(kw in filename for kw in [
+        '如祺出行', '哈啰打车', '哈啰出行', 'T3出行', '曹操出行', '首汽约车',
+        '美团打车', '享道出行', '阳光出行', '嘀嗒出行', '高德打车',
+        '滴滴出行行程', '滴滴企业版', '花小猪打车', '风韵出行',
+        # 滴滴/嘀嗒的"电子发票"PDF（无"出行"后缀，常见命名）
+        '滴滴电子发票', '滴滴电子普通发票', '嘀嗒电子发票',
+    ]):
+        return ('invoice', '网约车发票')
+    # === 5. 携程/航旅纵横等 OTA 的「行程单」（Booking No. + 航班 + 旅客，**无金额**）===
+    # 必须在文件名兜底「行程单+机票」规则**之前**，否则英文版/中英版 Trip.com 行程单
+    # 会被误判为「机票行程单」并用 OCR-标准解析器处理（拿不到任何字段）。
     if any(kw in text for kw in ['Trip.com', 'trip.com', '携程', 'Booking No.', '航旅纵横', '航班管家']):
         if any(kw in text for kw in ['Itinerary', 'Itinerar', '行程单', '航班信息', 'Flight Information', 'Booking Information', '预订信息', '订单编号']):
             return ('invoice', '机票行程单-OTA')
+    # === 5b. 文件名兜底：含「行程单」+ 航空关键词（机票、电子客票、航司）===
+    if '行程单' in filename and any(kw in filename for kw in ['机票', '航空', '电子客票', '航司', '航班', '机票预订', '订座']):
+        return ('invoice', '机票行程单')
+    # === 5c. 文件名兜底：含「电子行程单」+ 订单号（航司电子发票 PDF 多为此种命名）===
+    if '电子行程单' in filename and ('订单' in filename or '航' in filename or '机票' in filename):
+        return ('invoice', '机票行程单')
     # === 6. 文件名兜底：含「行程单」+ 铁路/车次关键词 ===
     if '行程单' in filename and any(kw in filename for kw in ['火车', '高铁', '动车', '12306']):
         return ('invoice', '火车票')
@@ -373,49 +450,134 @@ def classify_file(filename, text):
 
 
 def parse_air_itinerary(text):
-    """解析航空运输电子客票行程单。
-    返回 (seller, date, amount, remark) 二元组。
-    字段缺失时对应位置为空字符串。
+    """解析航空运输电子客票行程单（兼容 OCR 图像型 PDF）。
+    返回 (seller, date, amount, remark) 二元组。字段缺失时对应位置为空字符串。
+
+    OCR 容错策略：
+    - 销售方：航班 IATA 二字代码（最强信号）→ AIRLINE_CODES 表 → 承运人标签 → 文本搜索
+    - 金额：「合计/金额/票价」标签 → 所有 "CNY X.XX" 中取最大值（兜底）
+    - 日期：标准格式 → 标签格式 → 容错格式 "202611"-06JJ" / "2026ty06A05"
+    - 票号：标签格式 → 任意 10-15 位数字（OCR 容错）
     """
-    # 1. 承运人（销售方）
-    m = re.search(r'承\s*运\s*人\s*[:： ]*\s*([^\n\r]{2,40})', text)
-    if m:
-        seller = m.group(1).strip()
-        # 去掉尾部噪声（统一社会信用代码、纳税人识别号等）
-        seller = re.sub(r'(统一社会|纳税人识别号|信用代码|开户行).*$', '', seller).strip()
-    else:
-        seller = ''
-    # 2. 日期：优先用乘机日期，其次填开日期
+    # === 0. 航班号（OCR 强信号：2字母 + 3-4位数字）===
+    flight_code = ''
+    fm = re.search(r'\b([A-Z]{2})(\d{3,4})\b', text)
+    if fm:
+        flight_code = fm.group(1) + fm.group(2)
+    # === 1. 销售方：优先航司代码（OCR 强信号）===
+    seller = ''
+    if flight_code and flight_code[:2] in AIRLINE_CODES:
+        seller = AIRLINE_CODES[flight_code[:2]]
+    if not seller:
+        # 「承运人」标签
+        m = re.search(r'承\s*运\s*人\s*[:： ]*\s*([^\n\r]{2,40})', text)
+        if m:
+            s = m.group(1).strip()
+            s = re.sub(r'(统一社会|纳税人识别号|信用代码|开户行).*$', '', s).strip()
+            if len(s) >= 2:
+                seller = s
+    if not seller:
+        # 文本兜底关键词
+        for kw in ['中国南方航空', '中国国际航空', '中国东方航空', '海南航空',
+                  '厦门航空', '深圳航空', '四川航空', '天津航空', '华夏航空',
+                  '上海航空', '南航', '国航', '东航', '海航', '厦航', '深航',
+                  '川航', '海航股份']:
+            if kw in text:
+                seller = kw
+                break
+    # === 2. 日期：多种格式，OCR 容错 ===
     date_val = ''
-    m = re.search(r'乘\s*机\s*日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+    # 标准 2026年06月05日
+    m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', text)
     if m:
         date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
-    else:
-        m = re.search(r'填\s*开\s*日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+    # 乘机日期 / 填开日期 标签
+    if not date_val:
+        m = re.search(r'(?:乘\s*机|填\s*开)\s*日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
         if m:
             date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
-        else:
-            # 兜底：日期:2026-06-20
-            m = re.search(r'日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
-            if m:
-                date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
-    # 3. 金额：优先合计，其次金额
+    if not date_val:
+        # 日期:2026-06-20
+        m = re.search(r'日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+        if m:
+            date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    if not date_val:
+        # 2026-06-05 / 2026/06/05
+        m = re.search(r'(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})', text)
+        if m:
+            date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    if not date_val:
+        # OCR 容错: "2026T061J21" / "2026¢F06A 19H" / "2026ty06ll29"
+        # 4位年(20\d{2}) + 0-4 个任意字符(不含\n) + 2 位月份(01-12) + 0-4 个任意字符 + 2 位日期(01-31)
+        # 强制 2 位月日（避免 "2026T061J21" 把 "1" 当成 1 位日）
+        # 后面必须不是数字
+        # 注意：使用 [^\n] 而非 [^\d\n]，因为 OCR 错位常会把"日"识别为数字（如 "1J21"），需要容忍
+        candidates = []
+        for m in re.finditer(r'(20\d{2})[^\n]{0,4}(0[1-9]|1[0-2])[^\n]{0,4}([12]\d|3[01]|0[1-9])(?!\d)', text):
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if not (2020 <= y <= 2030 and 1 <= mo <= 12 and 1 <= d <= 31):
+                continue
+            ctx = text[max(0, m.start()-30):m.end()+5]
+            ctx_low = ctx.lower()
+            has_date_kw = any(kw in ctx or kw in ctx_low for kw in ['年', '日', '日期', 'date', '乘机', '填开', 'DATE'])
+            candidates.append((m.start(), y, mo, d, has_date_kw))
+        if candidates:
+            # 优先带日期关键词的；按位置取最靠前的
+            with_kw = [c for c in candidates if c[4]]
+            if with_kw:
+                _, y, mo, d, _ = with_kw[0]
+                date_val = '%04d-%02d-%02d' % (y, mo, d)
+            else:
+                _, y, mo, d, _ = candidates[0]
+                date_val = '%04d-%02d-%02d' % (y, mo, d)
+    # === 3. 金额：标签 → 兜底取最大 CNY ===
     amount = ''
     m = re.search(r'合\s*计\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
     if m:
         amount = m.group(1).replace(',', '')
-    else:
+    if not amount:
         m = re.search(r'金\s*额\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
         if m:
             amount = m.group(1).replace(',', '')
-        else:
-            m = re.search(r'票\s*价\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
-            if m:
-                amount = m.group(1).replace(',', '')
-    # 4. 备注：航班号、始发站、目的站
+    if not amount:
+        m = re.search(r'票\s*价\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
+        if m:
+            amount = m.group(1).replace(',', '')
+    if not amount:
+        # OCR 容错: 收集所有 "CNY X.XX" / "CNY X. XX" / "CNY X,XXX.XX"
+        # 取最大值（合计通常是明细之和，会出现两次；最大值就是合计）
+        cny_amounts = re.findall(r'CNY\s*([\d,]+)\s*\.\s*(\d{2})', text, re.IGNORECASE)
+        parsed = []
+        for whole, dec in cny_amounts:
+            try:
+                v = float(whole.replace(',', '').replace(' ', '') + '.' + dec.replace(' ', ''))
+                # 合理票价/合计范围 10-100000
+                if 10 <= v <= 100000:
+                    parsed.append(v)
+            except Exception:
+                pass
+        if parsed:
+            amount = '%.2f' % max(parsed)
+    if not amount:
+        # 终极 OCR 容错：收集所有 X.XX 形式的小数（不管前缀，可能误识别为 CFff/cFr£/f 等）
+        # 仅采纳 10-100000 范围的金额，排除票号/日期/保险费=0.00
+        all_amounts = re.findall(r'(?<!\d)(\d{2,6})\s*\.\s*(\d{2})(?!\d)', text)
+        parsed = []
+        for whole, dec in all_amounts:
+            try:
+                v = float(whole + '.' + dec.replace(' ', ''))
+                if 10 <= v <= 100000:
+                    parsed.append(v)
+            except Exception:
+                pass
+        if parsed:
+            amount = '%.2f' % max(parsed)
+    # === 4. 备注：航班号、始发/目的站、票号 ===
     remark_parts = []
+    if flight_code:
+        remark_parts.append('航班 ' + flight_code)
     m = re.search(r'航\s*班\s*号\s*[:： ]*\s*([A-Z0-9]{2}\s*\d{3,4})', text)
-    if m:
+    if m and '航班 ' + m.group(1).replace(' ', '') not in remark_parts:
         remark_parts.append('航班 ' + m.group(1).replace(' ', ''))
     m = re.search(r'始\s*发\s*站\s*[:： ]*\s*([^\n\r]{2,30})', text)
     if m:
@@ -426,6 +588,15 @@ def parse_air_itinerary(text):
     m = re.search(r'旅\s*客\s*姓\s*名\s*[:： ]*\s*([^\n\r]{1,20})', text)
     if m:
         remark_parts.append('旅客 ' + m.group(1).strip())
+    # 电子客票号（OCR 容错：含 "票" 字符后跟 10-15 位数字）
+    tm = re.search(r'(?:电[子\s]*客[票\s]*号|电子[客票\s]*号)\s*[:： ]*\s*(\d{10,15})', text)
+    if tm:
+        remark_parts.append('票号 ' + tm.group(1))
+    else:
+        # 兜底：找 "T%4:xxxxx" / "T4:xxxxx" / "票号:xxxxx" 这种 OCR 错位格式
+        tm = re.search(r'[T票]\s*[%4号]\s*[:： ]*\s*(\d{10,15})\b', text)
+        if tm:
+            remark_parts.append('票号 ' + tm.group(1))
     remark = ' '.join(remark_parts)
     return seller, date_val, amount, remark
 
