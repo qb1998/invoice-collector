@@ -1457,7 +1457,9 @@ let amountCell='-';
 if(item.amount){
 amountCell='<span style="color:#DC2626;font-weight:600;">¥'+item.amount+'</span>';
 }
-tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td style="font-size:12px;color:#6B7280;">'+(item.email_date||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td><td><button class="btn-row-delete" onclick="removeItem(\\''+(item.source_file||'').replace(/'/g,"\\'")+'\\',\\''+item.item_type+'\\')" title="删除此单据">🗑</button></td>';
+tr.innerHTML='<td style="'+(item.is_duplicate?'color:#9CA3AF;font-style:italic;':'')+'">'+(item.seq||'—')+'</td><td>'+badge+'</td><td>'+(item.region||'-')+'</td><td>'+(item.category||'-')+'</td><td style="font-size:12px;color:#6B7280;">'+(item.email_date||'-')+'</td><td>'+(item.date||'-')+'</td><td style="font-family:monospace;font-size:12px;">'+(item.invoice_no||'-')+'</td><td>'+amountCell+'</td><td>'+(item.buyer||'-')+'</td><td>'+(item.seller||'-')+'</td><td style="font-size:12px;'+(item.is_duplicate?'color:#DC2626;font-weight:500;':'')+'">'+(item.remark||'')+'</td><td><button class="btn-row-delete" data-source="'+(item.source_file||'').replace(/"/g,'&quot;')+'" data-type="'+item.item_type+'" title="删除此单据">🗑</button></td>';
+const delBtn=tr.querySelector('.btn-row-delete');
+if(delBtn){delBtn.addEventListener('click',function(){removeItem(this.getAttribute('data-source')||'',this.getAttribute('data-type')||'');});}
 tbody.appendChild(tr);
 });
 }else{
