@@ -96,16 +96,66 @@ def parse_imap_date(date_str):
     return '%02d-%s-%04d' % (dt.day, months[dt.month-1], dt.year)
 
 # ===== PDF Extraction =====
+def _ocr_pdf_with_vision(fpath, dpi=300):
+    """用 macOS Vision framework 对 PDF 跑 OCR 兜底。
+    适用于：纯图像 PDF（pdfplumber 提取不到文字）。
+    返回 OCR 出的文字。
+    """
+    try:
+        import io
+        import tempfile
+        import os
+        # 把 PDF 第一页渲染为 PNG（高分辨率）
+        with pdfplumber.open(str(fpath)) as pdf:
+            if not pdf.pages:
+                return ''
+            img = pdf.pages[0].to_image(resolution=dpi)
+            img_buf = io.BytesIO()
+            img.original.save(img_buf, format='PNG')
+            img_bytes = img_buf.getvalue()
+        if not img_bytes:
+            return ''
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            f.write(img_bytes)
+            tmp_png = f.name
+        try:
+            # 动态导入，避免在 Linux 平台 import 失败
+            from Foundation import NSURL
+            from Vision import VNRecognizeTextRequest, VNImageRequestHandler
+            url = NSURL.fileURLWithPath_(tmp_png)
+            handler = VNImageRequestHandler.alloc().initWithURL_options_(url, None)
+            request = VNRecognizeTextRequest.alloc().init()
+            request.setRecognitionLevel_(1)  # 1=accurate
+            request.setUsesLanguageCorrection_(False)
+            request.setRecognitionLanguages_(['zh-Hans', 'en-US'])
+            ok, err = handler.performRequests_error_([request], None)
+            if not ok:
+                return ''
+            results = request.results() or []
+            lines = []
+            for r in results:
+                cands = r.topCandidates_(1)
+                if cands and cands[0].confidence() >= 0.3:
+                    lines.append(cands[0].string())
+            return '\n'.join(lines)
+        finally:
+            try:
+                os.unlink(tmp_png)
+            except Exception:
+                pass
+    except Exception:
+        return ''
+
+
 def parse_pdf(fpath):
-    """提取 PDF 文本。两次尝试：普通模式 + layout 模式（对行程单等特殊字体 PDF 更稳）。"""
+    """提取 PDF 文本。多次兜底：普通 -> layout -> OCR（仅 macOS）。"""
+    text = ''
     try:
         with pdfplumber.open(str(fpath)) as pdf:
-            text = ''
             for p in pdf.pages:
                 t = p.extract_text()
                 if t:
                     text += t + '\n'
-            # 兜底：若普通模式提取的内容 < 50 字符（可能是字体问题导致乱码/空），用 layout 重试
             if len(text.strip()) < 50:
                 text2 = ''
                 for p in pdf.pages:
@@ -114,9 +164,14 @@ def parse_pdf(fpath):
                         text2 += t + '\n'
                 if len(text2.strip()) > len(text.strip()):
                     text = text2
-            return text
     except Exception as e:
         return 'ERROR: %s' % e
+    # OCR 兜底：纯图像 PDF（macOS Vision）
+    if len(text.strip()) < 50:
+        ocr_text = _ocr_pdf_with_vision(fpath)
+        if ocr_text.strip() and len(ocr_text.strip()) > len(text.strip()):
+            text = ocr_text
+    return text
 
 def extract_seller(text, buyer_name=''):
     """提取销售方名称。兼容多种格式：
@@ -261,13 +316,24 @@ def classify_file(filename, text):
     if any(kw in text for kw in ['中国铁路', '12306', '电子发票(铁路电子客票)', '铁路电子客票', '高铁', '动车票']):
         return ('invoice', '火车票')
     # === 3. 网约车/出租车行程单 ===
-    if any(kw in text for kw in ['滴滴出行行程单', '网约车行程单', '电子行程单（出租汽车）', '出租汽车发票', '滴滴出行']):
+    if any(kw in text for kw in [
+        '滴滴出行行程单', '网约车行程单', '电子行程单（出租汽车）', '出租汽车发票', '滴滴出行',
+        # 第三方网约车聚合平台（阳光/享道/如祺/哈啰/T3/曹操/首汽等）行程报销单
+        '第三方网约车', '阳光出行', '享道出行', '如祺出行', '哈啰打车', '哈啰出行',
+        'T3出行', '曹操出行', '首汽约车', '美团打车',
+    ]):
         return ('invoice', '网约车发票')
-    # === 4. 文件名兜底：含「行程单」+ 网约车关键词 ===
-    if '行程单' in filename and any(kw in filename for kw in ['滴滴', '出租', '打车', '网约', '高德', 'T3', '曹操', '首汽', '嘀嗒', '美团']):
+    # === 4. 文件名兜底：含「行程单」/「行程报销单」+ 网约车关键词 ===
+    if ('行程单' in filename or '行程报销单' in filename) and any(kw in filename for kw in [
+        '滴滴', '出租', '打车', '网约', '高德', 'T3', '曹操', '首汽', '嘀嗒', '美团',
+        '阳光', '享道', '如祺', '哈啰', '第三方',
+    ]):
         return ('invoice', '网约车发票')
     # === 5. 文件名兜底：含「行程单」+ 航空关键词（机票、电子客票、航司）===
-    if '行程单' in filename and any(kw in filename for kw in ['机票', '航空', '电子客票', '航司', '航班']):
+    if '行程单' in filename and any(kw in filename for kw in ['机票', '航空', '电子客票', '航司', '航班', '机票预订', '订座']):
+        return ('invoice', '机票行程单')
+    # === 5b. 文件名兜底：含「电子行程单」+ 订单号（航司电子发票 PDF 多为此种命名）===
+    if '电子行程单' in filename and ('订单' in filename or '航' in filename or '机票' in filename):
         return ('invoice', '机票行程单')
     # === 6. 文件名兜底：含「行程单」+ 铁路/车次关键词 ===
     if '行程单' in filename and any(kw in filename for kw in ['火车', '高铁', '动车', '12306']):
@@ -393,24 +459,48 @@ def parse_train_ticket(text):
 def parse_didi_receipt(text):
     """解析网约车/出租车行程单。
     返回 (seller, date, amount, remark)。
+    支持：滴滴/高德/T3/曹操/首汽/嘀嗒/美团/阳光/享道/如祺/哈啰 等。
+    也支持"第三方网约车服务提供方XX—行程单"格式（聚合平台行程报销单）。
     """
-    # 1. 销售方
+    # 1. 销售方：先识别聚合方，再识别具体平台
     seller = ''
-    for kw in ['滴滴出行', '滴滴', '高德', 'T3出行', '曹操出行', '首汽约车', '嘀嗒出行', '美团打车']:
+    # 聚合方/平台名
+    platform_keywords = [
+        '滴滴出行', '嘀嗒出行', '高德打车', '高德', 'T3出行', '曹操出行', '首汽约车', '美团打车',
+        '阳光出行', '享道出行', '如祺出行', '哈啰打车', '哈啰出行', '哈啰',
+    ]
+    for kw in platform_keywords:
         if kw in text:
             seller = kw
             break
+    # 如果是"第三方网约车服务提供方XX—行程单"格式，从标题里抠平台名
+    if not seller:
+        m = re.search(r'第三方网约车服务提供方([^\n\r—\-]{2,20})', text)
+        if m:
+            seller = '聚合网约车-' + m.group(1).strip().rstrip('—').strip()
     if not seller:
         seller = '网约车'
-    # 2. 日期
+    # 2. 日期：优先"行程起止日期"里的"起"日期，备选"申请日期"，最后兜底第一个 4-2-2 日期
     date_val = ''
-    m = re.search(r'(?:行程|乘车|服务|用\w*)\s*日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+    m = re.search(r'行程起止日期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
     if m:
         date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
     else:
-        m = re.search(r'(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+        m = re.search(r'(?:行程|乘车|服务|用\w*)\s*日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
         if m:
             date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+        else:
+            # 跳过"申请日期"取最早一个 4-2-2 日期
+            date_candidates = re.findall(r'(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+            for y, mo, d in date_candidates:
+                # 申请日期通常是最近日期，跳过
+                if '申请' in text.split(f'{y}-{int(mo):02d}-{int(d):02d}')[0][-20:]:
+                    continue
+                date_val = '%s-%02d-%02d' % (y, int(mo), int(d))
+                break
+            if not date_val and date_candidates:
+                y, mo, d = date_candidates[0]
+                date_val = '%s-%02d-%02d' % (y, int(mo), int(d))
     # 3. 金额
     amount = ''
     m = re.search(r'(?:实\w*付|合\w*计|金\w*额|总\w*额)\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
@@ -420,8 +510,14 @@ def parse_didi_receipt(text):
         m = re.search(r'[¥￥]\s*([\d,]+\.\d{2})', text)
         if m:
             amount = m.group(1).replace(',', '')
-    # 4. 备注
+    # 4. 备注：行程起止区间、笔数、起点终点
     remark_parts = []
+    m = re.search(r'行程起止日期\s*[:： ]*(\d{4}[.\-/年]\d{1,2}[.\-/月]\d{1,2}\s*至\s*\d{4}[.\-/年]\d{1,2}[.\-/月]\d{1,2})', text)
+    if m:
+        remark_parts.append(m.group(1).replace('年', '-').replace('月', '-').replace('日', '').replace('/', '-').replace('.', '-'))
+    m = re.search(r'共\s*(\d+)\s*笔行程', text)
+    if m:
+        remark_parts.append(m.group(1) + '笔')
     m = re.search(r'起\s*点\s*[:： ]*\s*([^\n\r]{2,30})', text)
     if m:
         remark_parts.append(m.group(1).strip())

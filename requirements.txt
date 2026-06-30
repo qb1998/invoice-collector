@@ -3,3 +3,6 @@ uvicorn>=0.24.0
 pdfplumber>=0.10.0
 openpyxl>=3.1.0
 python-multipart>=0.0.6
+# macOS 视觉 OCR（仅 macOS，用于识别纯图像 PDF；其他平台自动降级到 pdfplumber 文本提取）
+pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'
+pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'
