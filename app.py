@@ -97,6 +97,7 @@ def parse_imap_date(date_str):
 
 # ===== PDF Extraction =====
 def parse_pdf(fpath):
+    """提取 PDF 文本。两次尝试：普通模式 + layout 模式（对行程单等特殊字体 PDF 更稳）。"""
     try:
         with pdfplumber.open(str(fpath)) as pdf:
             text = ''
@@ -104,6 +105,15 @@ def parse_pdf(fpath):
                 t = p.extract_text()
                 if t:
                     text += t + '\n'
+            # 兜底：若普通模式提取的内容 < 50 字符（可能是字体问题导致乱码/空），用 layout 重试
+            if len(text.strip()) < 50:
+                text2 = ''
+                for p in pdf.pages:
+                    t = p.extract_text(layout=True, use_text_flow=True, x_tolerance=3, y_tolerance=3)
+                    if t:
+                        text2 += t + '\n'
+                if len(text2.strip()) > len(text.strip()):
+                    text = text2
             return text
     except Exception as e:
         return 'ERROR: %s' % e
@@ -163,7 +173,7 @@ def extract_amount(text):
     return ''
 
 def extract_subtotal_tax(text):
-    m = re.search(r'合\s*计\s*[¥￥]?\s*([\d,]+\.\d{2})\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
+    m = re.search(r'合\s*计\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
     if m:
         return m.group(1).replace(',', ''), m.group(2).replace(',', '')
     return '', ''
@@ -244,21 +254,182 @@ def determine_category(seller, text=''):
     return '其他'
 
 def classify_file(filename, text):
-    if '行程单' in filename or ('行程单' in text and '电子发票' not in text):
-        return ('supporting', '机票行程单')
+    # === 1. 航空电子客票行程单（这是报销凭证，应当作发票）===
+    if any(kw in text for kw in ['航空运输电子客票行程单', '航空运输客票', '电子客票行程单']):
+        return ('invoice', '机票行程单')
+    # === 2. 火车票/高铁票 ===
+    if any(kw in text for kw in ['中国铁路', '12306', '电子发票(铁路电子客票)', '铁路电子客票', '高铁', '动车票']):
+        return ('invoice', '火车票')
+    # === 3. 网约车/出租车行程单 ===
+    if any(kw in text for kw in ['滴滴出行行程单', '网约车行程单', '电子行程单（出租汽车）', '出租汽车发票', '滴滴出行']):
+        return ('invoice', '网约车发票')
+    # === 4. 文件名兜底：含「行程单」+ 网约车关键词 ===
+    if '行程单' in filename and any(kw in filename for kw in ['滴滴', '出租', '打车', '网约', '高德', 'T3', '曹操', '首汽', '嘀嗒', '美团']):
+        return ('invoice', '网约车发票')
+    # === 5. 文件名兜底：含「行程单」+ 航空关键词（机票、电子客票、航司）===
+    if '行程单' in filename and any(kw in filename for kw in ['机票', '航空', '电子客票', '航司', '航班']):
+        return ('invoice', '机票行程单')
+    # === 6. 文件名兜底：含「行程单」+ 铁路/车次关键词 ===
+    if '行程单' in filename and any(kw in filename for kw in ['火车', '高铁', '动车', '12306']):
+        return ('invoice', '火车票')
+    # === 7. 报销、出差安排材料（不是行程单）===
     if any(kw in filename for kw in ['课程日程', '酒店安排', '推荐航班', '出行须知', '课程']):
         return ('supporting', '出差行程材料')
     if any(kw in filename for kw in ['入住', '水单', '确认单']):
         return ('supporting', '酒店确认单')
+    # === 8. 标准电子发票 ===
     has_invoice_content = bool(re.search(r'发票号码|价税合计|开票日期', text))
     has_invoice_kw = '发票' in filename or 'dzfp' in filename.lower() or 'qklfp' in filename.lower()
     if has_invoice_content or has_invoice_kw:
         return ('invoice', '发票')
+    # === 9. 跳过明显非报销文件 ===
     skip_keywords = ['银行', '对账单', '流水', '签证', 'visa', 'eNoticeLetter',
                      '股票', '基金', '理财', '社保', '公积金', '工资']
     if any(kw in filename for kw in skip_keywords):
         return ('skip', '非报销文件')
     return ('unknown', '未识别')
+
+
+def parse_air_itinerary(text):
+    """解析航空运输电子客票行程单。
+    返回 (seller, date, amount, remark) 二元组。
+    字段缺失时对应位置为空字符串。
+    """
+    # 1. 承运人（销售方）
+    m = re.search(r'承\s*运\s*人\s*[:： ]*\s*([^\n\r]{2,40})', text)
+    if m:
+        seller = m.group(1).strip()
+        # 去掉尾部噪声（统一社会信用代码、纳税人识别号等）
+        seller = re.sub(r'(统一社会|纳税人识别号|信用代码|开户行).*$', '', seller).strip()
+    else:
+        seller = ''
+    # 2. 日期：优先用乘机日期，其次填开日期
+    date_val = ''
+    m = re.search(r'乘\s*机\s*日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+    if m:
+        date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    else:
+        m = re.search(r'填\s*开\s*日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+        if m:
+            date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+        else:
+            # 兜底：日期:2026-06-20
+            m = re.search(r'日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+            if m:
+                date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    # 3. 金额：优先合计，其次金额
+    amount = ''
+    m = re.search(r'合\s*计\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
+    if m:
+        amount = m.group(1).replace(',', '')
+    else:
+        m = re.search(r'金\s*额\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
+        if m:
+            amount = m.group(1).replace(',', '')
+        else:
+            m = re.search(r'票\s*价\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
+            if m:
+                amount = m.group(1).replace(',', '')
+    # 4. 备注：航班号、始发站、目的站
+    remark_parts = []
+    m = re.search(r'航\s*班\s*号\s*[:： ]*\s*([A-Z0-9]{2}\s*\d{3,4})', text)
+    if m:
+        remark_parts.append('航班 ' + m.group(1).replace(' ', ''))
+    m = re.search(r'始\s*发\s*站\s*[:： ]*\s*([^\n\r]{2,30})', text)
+    if m:
+        remark_parts.append(m.group(1).strip())
+    m = re.search(r'目\s*的\s*站\s*[:： ]*\s*([^\n\r]{2,30})', text)
+    if m:
+        remark_parts.append('→' + m.group(1).strip())
+    m = re.search(r'旅\s*客\s*姓\s*名\s*[:： ]*\s*([^\n\r]{1,20})', text)
+    if m:
+        remark_parts.append('旅客 ' + m.group(1).strip())
+    remark = ' '.join(remark_parts)
+    return seller, date_val, amount, remark
+
+
+def parse_train_ticket(text):
+    """解析火车票/高铁票。
+    返回 (seller, date, amount, remark)。
+    """
+    # 1. 销售方：中国铁路
+    seller = '中国铁路'
+    # 2. 日期
+    date_val = ''
+    m = re.search(r'日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+    if m:
+        date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    else:
+        m = re.search(r'(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})\s*\d{1,2}:\d{2}', text)
+        if m:
+            date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    # 3. 金额
+    amount = ''
+    m = re.search(r'[金票价]额\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
+    if m:
+        amount = m.group(1).replace(',', '')
+    else:
+        m = re.search(r'[¥￥]\s*([\d,]+\.\d{2})', text)
+        if m:
+            amount = m.group(1).replace(',', '')
+    # 4. 备注
+    remark_parts = []
+    m = re.search(r'车\s*次\s*[:： ]*\s*([A-Z]?\d{1,5})', text)
+    if m:
+        remark_parts.append('车次 ' + m.group(1).strip())
+    m = re.search(r'(?:发车|出发|始发)\s*[站:]?\s*[:： ]*\s*([^\n\r]{2,15})', text)
+    if m:
+        remark_parts.append(m.group(1).strip())
+    m = re.search(r'(?:到站|到达|终到)\s*[站:]?\s*[:： ]*\s*([^\n\r]{2,15})', text)
+    if m:
+        remark_parts.append('→' + m.group(1).strip())
+    m = re.search(r'旅\s*客\s*[:： ]*\s*([^\n\r]{1,15})', text)
+    if m:
+        remark_parts.append('旅客 ' + m.group(1).strip())
+    remark = ' '.join(remark_parts)
+    return seller, date_val, amount, remark
+
+
+def parse_didi_receipt(text):
+    """解析网约车/出租车行程单。
+    返回 (seller, date, amount, remark)。
+    """
+    # 1. 销售方
+    seller = ''
+    for kw in ['滴滴出行', '滴滴', '高德', 'T3出行', '曹操出行', '首汽约车', '嘀嗒出行', '美团打车']:
+        if kw in text:
+            seller = kw
+            break
+    if not seller:
+        seller = '网约车'
+    # 2. 日期
+    date_val = ''
+    m = re.search(r'(?:行程|乘车|服务|用\w*)\s*日\s*期\s*[:： ]*\s*(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+    if m:
+        date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    else:
+        m = re.search(r'(\d{4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})', text)
+        if m:
+            date_val = '%s-%02d-%02d' % (m.group(1), int(m.group(2)), int(m.group(3)))
+    # 3. 金额
+    amount = ''
+    m = re.search(r'(?:实\w*付|合\w*计|金\w*额|总\w*额)\s*[:：]?\s*[¥￥]?\s*([\d,]+\.\d{2})', text)
+    if m:
+        amount = m.group(1).replace(',', '')
+    else:
+        m = re.search(r'[¥￥]\s*([\d,]+\.\d{2})', text)
+        if m:
+            amount = m.group(1).replace(',', '')
+    # 4. 备注
+    remark_parts = []
+    m = re.search(r'起\s*点\s*[:： ]*\s*([^\n\r]{2,30})', text)
+    if m:
+        remark_parts.append(m.group(1).strip())
+    m = re.search(r'终\s*点\s*[:： ]*\s*([^\n\r]{2,30})', text)
+    if m:
+        remark_parts.append('→' + m.group(1).strip())
+    remark = ' '.join(remark_parts)
+    return seller, date_val, amount, remark
 
 def extract_uid_from_filename(filename):
     """Extract IMAP UID from saved filename (format: {uid}_{index}_{name})."""
@@ -509,10 +680,28 @@ def collect_invoices(task_id, config):
                         'email_date': _file_email_date,
                     })
                     continue
+                # 行程单/火车票/网约车：用专门解析器
+                _special_remark = ''
+                if subtype == '机票行程单':
+                    sp_seller, sp_date, sp_amount, sp_remark = parse_air_itinerary(text)
+                elif subtype == '火车票':
+                    sp_seller, sp_date, sp_amount, sp_remark = parse_train_ticket(text)
+                elif subtype == '网约车发票':
+                    sp_seller, sp_date, sp_amount, sp_remark = parse_didi_receipt(text)
+                else:
+                    sp_seller = sp_date = sp_amount = sp_remark = ''
                 inv_no_m = re.search(r'发票号码[：:\s]*(\d+)', text)
                 if not inv_no_m:
                     inv_no_m = re.search(r'(\d{20})', text)
-                inv_no = inv_no_m.group(1) if inv_no_m else ''
+                if not inv_no_m and subtype == '机票行程单':
+                    # 行程单用印刷序号代替发票号
+                    m = re.search(r'NO[\.：:\s]*\s*([A-Z0-9]{6,15})', text, re.IGNORECASE)
+                    if m:
+                        inv_no = m.group(1)
+                    else:
+                        inv_no = ''
+                else:
+                    inv_no = inv_no_m.group(1) if inv_no_m else ''
                 is_duplicate = False
                 duplicate_of_inv = None
                 if inv_no and inv_no in seen_inv_nos:
@@ -523,6 +712,15 @@ def collect_invoices(task_id, config):
                 date_val = extract_date(text)
                 amount = extract_amount(text)
                 no_tax, tax = extract_subtotal_tax(text)
+                # 行程单/火车票/网约车：优先用专门解析器的结果
+                if sp_seller:
+                    seller = sp_seller
+                if sp_date:
+                    date_val = sp_date
+                if sp_amount:
+                    amount = sp_amount
+                if sp_remark:
+                    _special_remark = sp_remark
                 if not seller:
                     fm = re.search(r'_([^_]+(?:有限公司|个体工商户|店|院))', fname)
                     if fm:
@@ -552,15 +750,20 @@ def collect_invoices(task_id, config):
                     continue
                 category = determine_category(seller, text)
                 region = determine_region(seller)
+                # 行程单/火车票/网约车：分类强制为「交通」
+                if subtype in ('机票行程单', '火车票', '网约车发票'):
+                    category = '交通'
                 inv = {
                     'invoice_no': inv_no, 'date': date_val, 'amount': amount,
                     'amount_no_tax': no_tax, 'tax': tax, 'buyer': buyer,
                     'seller': seller, 'region': region, 'category': category,
+                    'subtype': subtype,  # 保留子类型
                     'source_file': fname, 'source_path': fpath,
                     'row_type': '发票', 'file_uid': file_uid,
                     'is_duplicate': is_duplicate, 'duplicate_of': duplicate_of_inv,
                     'email_date': _file_email_date,
                     'text_snippet': text[:800],
+                    'remark': _special_remark,  # 行程单/车票的备注
                 }
                 invoices.append(inv)
                 if inv_no and not is_duplicate:
